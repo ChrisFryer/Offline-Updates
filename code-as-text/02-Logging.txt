@@ -1,0 +1,92 @@
+﻿# =====================================================================
+#  02-Logging.ps1  -  ONE FUNCTION THAT WRITES EVERYWHERE
+# ---------------------------------------------------------------------
+#  Every message goes to three places so nothing is ever lost:
+#    1. logs\Patcher-YYYYMMDD.log   (permanent record, open it in Notepad)
+#    2. the PowerShell console       (colour coded, stays open behind the GUI)
+#    3. the log box inside the GUI   (once the GUI exists)
+#
+#  Levels:  INFO  = normal chatter        OK    = something succeeded
+#           WARN  = look at this          ERROR = something failed
+#           CMD   = the exact command we are about to run (copy/paste it to
+#                   reproduce by hand)   WHY   = explains the reasoning
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  REVIEW RECORD  -  02-Logging.ps1
+# ---------------------------------------------------------------------
+#  Independent review 2026-10-14 (see CODE-REVIEW.md).  Changed here:
+#  R-18 audit trail - Get-OperatorIdentity is stamped on the session
+#  header, every INSTALL / CONFIRM / RESULT / REBOOT line and the event
+#  written on the target server.  No password or token is ever logged.
+#  ---------------------------------------------------------------------
+#  HUMAN REVIEW  (fill in by hand and keep it in the file)
+#  Reviewer   : ______________________________   Date : ______________
+#  Verdict    : [ ] Approved   [ ] Approved with comments   [ ] Changes required
+#  Comments   :
+#    -
+# =====================================================================
+
+function Get-OperatorIdentity {
+    # "CORP\operator" or "CORP\operator (WinRM as CORP\svc-patching)" when alternate credentials are set.
+    $who = $script:Operator
+    if (-not $who) { $who = "$env:USERDOMAIN\$env:USERNAME" }
+    if ($script:Credential -and $script:Credential.UserName -ne $who) { $who += " (WinRM as $($script:Credential.UserName))" }
+    return $who
+}
+
+function Write-PatchLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Message,
+        [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'CMD', 'WHY')][string]$Level = 'INFO'
+    )
+
+    $line = '{0} [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+
+    # 1. File (the folder is created on first use)
+    try {
+        if (-not (Test-Path -Path $script:Config.LogFolder)) {
+            New-Item -ItemType Directory -Path $script:Config.LogFolder -Force | Out-Null
+        }
+        Add-Content -Path (Get-PatchLogPath) -Value $line -ErrorAction Stop
+    } catch {
+        Write-Host "Could not write to log file: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    # 2. Console
+    $consoleColour = switch ($Level) {
+        'OK'    { 'Green' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+        'CMD'   { 'Cyan' }
+        'WHY'   { 'DarkGray' }
+        default { 'White' }
+    }
+    Write-Host $line -ForegroundColor $consoleColour
+
+    # 3. GUI log box (only if the GUI has been built and is still open)
+    $box = $script:Gui['LogBox']
+    if ($box -and -not $box.IsDisposed) {
+        $guiColour = switch ($Level) {
+            'OK'    { 'Green' }
+            'WARN'  { 'DarkOrange' }
+            'ERROR' { 'Red' }
+            'CMD'   { 'RoyalBlue' }
+            'WHY'   { 'Gray' }
+            default { 'Black' }
+        }
+        $box.SelectionStart  = $box.TextLength
+        $box.SelectionLength = 0
+        $box.SelectionColor  = [System.Drawing.Color]::FromName($guiColour)
+        $box.AppendText($line + "`r`n")
+        $box.ScrollToCaret()
+        # Let the window repaint so the operator sees progress while we are busy.
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+function Get-PatchLogPath {
+    # Today's log file, e.g. logs\Patcher-20261013.log
+    return (Join-Path $script:Config.LogFolder ('Patcher-{0}.log' -f (Get-Date -Format 'yyyyMMdd')))
+}

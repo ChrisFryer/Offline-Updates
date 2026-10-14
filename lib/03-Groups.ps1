@@ -1,0 +1,113 @@
+﻿# =====================================================================
+#  03-Groups.ps1  -  READ THE SERVER LISTS (PatchGroup-A.txt etc.)
+# ---------------------------------------------------------------------
+#  Rules for a group file (any *.txt in the root folder):
+#    * one server name per line (short name or FQDN)
+#    * blank lines are ignored
+#    * anything after a # is a comment:   SRV-APP01   # finance app
+#    * the file name (without .txt) becomes the group name
+#  A .txt file that contains lines that do not look like host names is
+#  ignored, so the "code-as-text" copies can never be mistaken for lists.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  REVIEW RECORD  -  03-Groups.ps1
+# ---------------------------------------------------------------------
+#  Independent review 2026-10-14 (see CODE-REVIEW.md).  Changed here:
+#  R-06 Get-UniqueNames de-duplicates case-insensitively (Select-Object
+#  -Unique is case-sensitive in 5.1) and warns when two entries look like
+#  the same server (short name vs FQDN); R-26 IP addresses are warned
+#  about because they force NTLM instead of Kerberos.
+#  ---------------------------------------------------------------------
+#  HUMAN REVIEW  (fill in by hand and keep it in the file)
+#  Reviewer   : ____CF__________________________   Date : ___14-10-2026___________
+#  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
+#  Comments   :
+#    -
+# =====================================================================
+
+function Test-LooksLikeHostname {
+    param([string]$Text)
+    # letters, digits, dots and dashes only - that is all a host name can contain
+    return ($Text -match '^[A-Za-z0-9][A-Za-z0-9.\-]*$')
+}
+
+function Get-UniqueNames {
+    # Case-INsensitive de-duplication that keeps the original order.  (Select-Object -Unique
+    # treats SRV01 and srv01 as two different servers in PowerShell 5.1 - that would mean two
+    # concurrent installs on one box.)
+    param([string[]]$Names)
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    $out = @()
+    foreach ($n in @($Names)) {
+        if (-not $n) { continue }
+        $t = $n.Trim()
+        if ($t -and $seen.Add($t)) { $out += $t }
+    }
+    return $out
+}
+
+function Get-PatchGroups {
+    # Returns one object per group:  Name, File, Servers (array of strings)
+    $groups = @()
+    $files  = @(Get-ChildItem -Path $script:RootFolder -Filter '*.txt' -File | Sort-Object Name)
+
+    foreach ($file in $files) {
+        $servers = @()
+        $odd     = $null
+        foreach ($raw in (Get-Content -Path $file.FullName)) {
+            $line = ($raw -split '#')[0].Trim()          # drop comments and whitespace
+            if (-not $line) { continue }                  # skip blank lines
+            if (-not (Test-LooksLikeHostname $line)) { $odd = $line; break }
+            $servers += $line
+        }
+        if ($odd) {
+            Write-PatchLog "Ignoring $($file.Name) - not a server list (first odd line: '$odd')" 'WHY'
+            continue
+        }
+        $servers = @(Get-UniqueNames $servers)
+        $groups += [pscustomobject]@{
+            Name    = $file.BaseName
+            File    = $file.FullName
+            Servers = $servers
+        }
+        Write-PatchLog ("Group '{0}' loaded with {1} server(s) from {2}" -f $file.BaseName, $servers.Count, $file.Name) 'INFO'
+        foreach ($s in $servers) {
+            if ($s -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                Write-PatchLog "  -> '$s' is an IP address: WinRM cannot use Kerberos for it and will fall back to NTLM, which needs TrustedHosts on this PC. Use the server's FQDN instead." 'WARN'
+            }
+        }
+        if ($servers.Count -eq 0) {
+            Write-PatchLog "  -> $($file.Name) has no servers yet. Open it in Notepad and add one name per line." 'WARN'
+        }
+    }
+
+    if ($groups.Count -eq 0) {
+        Write-PatchLog "No group files found in $script:RootFolder - create e.g. PatchGroup-A.txt with one server per line" 'WARN'
+    }
+    # Same server written two ways (SRV01 and srv01.corp.local) across the groups?  Say so - the
+    # install itself also de-duplicates by the server's real name after the status check.
+    $byLabel = @{}
+    foreach ($g in $groups) {
+        foreach ($s in $g.Servers) {
+            $label = ($s -split '\.')[0].ToLower()
+            if (-not $byLabel.ContainsKey($label)) { $byLabel[$label] = @() }
+            if ($byLabel[$label] -notcontains $s) { $byLabel[$label] += $s }
+        }
+    }
+    foreach ($label in $byLabel.Keys) {
+        if ($byLabel[$label].Count -gt 1) { Write-PatchLog ("  -> '{0}' is listed as {1} - probably the same server; it will be patched once" -f $label, ($byLabel[$label] -join ' and ')) 'WARN' }
+    }
+    $script:Groups = $groups
+    return $groups
+}
+
+function Get-GroupServers {
+    # All unique server names across the given group names ('*' = every group)
+    param([string[]]$GroupName = '*')
+    $names = @()
+    foreach ($g in $script:Groups) {
+        if ($GroupName -contains '*' -or $GroupName -contains $g.Name) { $names += $g.Servers }
+    }
+    return @(Get-UniqueNames $names)
+}

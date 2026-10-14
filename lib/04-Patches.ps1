@@ -1,0 +1,284 @@
+﻿# =====================================================================
+#  04-Patches.ps1  -  FIND AND VET THE PATCH FILES IN \patches
+# ---------------------------------------------------------------------
+#  The tool is fully offline: you download the .msu (or .cab) files from
+#  the Microsoft Update Catalog on a machine that has internet, then
+#  drop them into the "patches" folder next to the launcher.
+#
+#  For every file the tool works out, once, and caches in patches\_info:
+#    KB number     from the FILE NAME  (windows10.0-kb5122882-x64_....msu -> KB5122882)
+#    Target build  from INSIDE the file (expand.exe reads one small XML)   -> 20348 = Server 2022
+#    Signature     Get-AuthenticodeSignature: must be Valid and signed by Microsoft
+#    SHA256        used to verify the copy on the server and again right before DISM
+#  Get-PatchVerdict at the bottom is THE decision "can this KB go on this
+#  server?" - the grid cells and the install plan both call it.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  REVIEW RECORD  -  04-Patches.ps1
+# ---------------------------------------------------------------------
+#  Independent review 2026-10-14 (see CODE-REVIEW.md).  Fixed here:
+#  R-09 no Authenticode check of the .msu; R-11 OS guard failed open when
+#  the build could not be read and the _info cache ignored a replaced
+#  file; R-12 grid and plan used two different rule orders (now one
+#  function, Get-PatchVerdict); R-17 -Path used on file-derived names
+#  (now -LiteralPath); R-20 two files with the same KB were not flagged.
+#  ---------------------------------------------------------------------
+#  HUMAN REVIEW  (fill in by hand and keep it in the file)
+#  Reviewer   : ___CF__________________________   Date : ___14-10-2026___________
+#  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
+#  Checked    : [x] read every function   [x] ran Get-PatchFiles on a real .msu
+#               [x] compared with CODE-REVIEW.md
+#  Comments   :
+#    -
+#    -
+# =====================================================================
+
+# Shown by the "Where do I get patches?" button and in the Code Tour.  Edit freely.
+$script:PatchHowTo = @'
+HOW TO FIND AND DOWNLOAD THIS MONTH'S PATCH  (on a machine that has internet)
+
+1. Find the latest KB number - the update history page is easiest
+   Search "Windows Server 2022 update history" or open
+   https://support.microsoft.com/help/5005454   (the Server 2022 history hub)
+   The left-hand list is newest first, e.g.
+      "September 8, 2026 - KB5122882 (OS Build 20348.5622)"
+   The top entry WITHOUT the word "Preview" is the current cumulative update (LCU).
+   Note the OS Build number: compare it with the Build column in the grid to see
+   which servers are already current.
+   Numbers only, per Server version:
+   https://learn.microsoft.com/windows/release-health/windows-server-release-info
+
+2. Download it from the Microsoft Update Catalog
+   Each history article has a "Microsoft Update Catalog" link under
+   "How to get this update", or open https://www.catalog.update.microsoft.com
+   and search for the KB number, e.g.   KB5122882
+   Server 2022 is listed as:
+      "Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems"
+   Server 2025 is listed as:
+      "... Microsoft server operating system version 24H2 ..."
+   Click Download, save the .msu, KEEP THE FILE NAME, copy it into the \patches folder.
+
+3. Sanity checks before you start
+   * File name starts with windows10.0-kb... for Server 2022  (windows11.0-kb... = Server 2025).
+   * The servicing stack update (SSU) is bundled inside the Server 2022 LCU - one file is enough.
+   * .NET Framework updates are separate KBs; add them the same way if they are required.
+   * Press "Reload lists + patches" and check the new KB column appears in the grid.
+   * The patch list shows the OS the file is for and "UNSIGNED" if the signature is not valid.
+'@
+
+function Get-PatchFiles {
+    # Returns one object per usable patch file:
+    #   Name, FullName, KB, SizeMB, Type, OsLine, TargetBuild, TargetOs, Signature, Signer, Hash
+    if (-not (Test-Path -LiteralPath $script:Config.PatchFolder)) {
+        New-Item -ItemType Directory -Path $script:Config.PatchFolder -Force | Out-Null
+        Write-PatchLog "Created empty patch folder $($script:Config.PatchFolder)" 'WARN'
+    }
+
+    $patches = @()
+    $files = @(Get-ChildItem -LiteralPath $script:Config.PatchFolder -File |
+               Where-Object { $_.Extension -in '.msu', '.cab' } |
+               Sort-Object Name)
+
+    foreach ($file in $files) {
+        if ($file.Name -match '(?i)(KB\d{6,7})') {
+            $kb = $Matches[1].ToUpper()
+        } else {
+            Write-PatchLog "Skipping '$($file.Name)' - no KB number in the file name. Rename it to include e.g. KB5034770" 'WARN'
+            continue
+        }
+        # "windows10.0-kb..." = Server 2016/2019/2022 line, "windows11.0-kb..." = Windows 11 / Server 2025 line
+        $osLine = ''
+        if ($file.Name -match '(?i)^(windows\d+\.\d+)') { $osLine = $Matches[1].ToLower() }
+        Write-PatchLog ("Patch found: {0}  ({1} MB, {2})" -f $kb, [math]::Round($file.Length / 1MB, 1), $file.Name) 'INFO'
+
+        $info = Get-PatchFileInfo -Path $file.FullName
+        $patches += [pscustomobject]@{
+            Name        = $file.Name
+            FullName    = $file.FullName
+            KB          = $kb
+            SizeMB      = [math]::Round($file.Length / 1MB, 1)
+            Type        = $file.Extension.TrimStart('.').ToLower()
+            OsLine      = $osLine
+            TargetBuild = $info.TargetBuild
+            TargetOs    = (Get-OsNameForBuild -Build $info.TargetBuild)
+            Signature   = $info.Signature
+            Signer      = $info.Signer
+            Hash        = $info.Hash
+        }
+        if ($info.Signature -ne 'Valid') {
+            Write-PatchLog "  -> $kb signature is '$($info.Signature)' (signer: '$($info.Signer)'). It will show as 'Blocked: signature' unless RequireValidSignature is turned off in 01-Config.ps1" 'WARN'
+        }
+        if ($info.TargetBuild -eq 0) {
+            Write-PatchLog "  -> $kb target build could not be read from inside the file. It will show as 'Blocked: OS unknown' unless AllowUnknownTargetBuild is turned on" 'WARN'
+        }
+    }
+
+    # Two files with one KB (e.g. the .NET CU for 4.8 and 4.8.1) get two identical columns - say so.
+    foreach ($group in ($patches | Group-Object KB | Where-Object { $_.Count -gt 1 })) {
+        Write-PatchLog ("  -> {0} appears {1} times ({2}). Both columns show the same state; each file is still installed separately." -f $group.Name, $group.Count, (($group.Group | ForEach-Object { $_.Name }) -join ', ')) 'WARN'
+    }
+    if ($patches.Count -eq 0) {
+        Write-PatchLog "No .msu/.cab files in $($script:Config.PatchFolder) - status checks still work, installs need a file" 'WARN'
+    }
+    $script:Patches = $patches
+    return $patches
+}
+
+# Known Windows builds (the number BEFORE the dot in 20348.5622) -> friendly names.
+$script:BuildNames = @{
+    14393 = 'Server 2016'; 17763 = 'Server 2019'; 20348 = 'Server 2022'; 26100 = 'Server 2025 / Win11 24H2'
+    19041 = 'Windows 10 2004'; 19042 = 'Windows 10 20H2'; 19043 = 'Windows 10 21H1'; 19044 = 'Windows 10 21H2'; 19045 = 'Windows 10 22H2'
+    22000 = 'Windows 11 21H2'; 22621 = 'Windows 11 22H2'; 22631 = 'Windows 11 23H2'
+}
+
+function Get-OsNameForBuild {
+    param([int]$Build)
+    if ($Build -le 0) { return 'unknown' }
+    if ($script:BuildNames.ContainsKey($Build)) { return $script:BuildNames[$Build] }
+    return "build $Build"
+}
+
+function Get-PatchFileInfo {
+    # Target build + signature + SHA256 of one file, cached in patches\_info\<file>.txt.
+    # The cache is only trusted when the file's size and last-write time still match (a replaced
+    # file with the same name is read again).  Reading takes a few seconds for a 600 MB file.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $file = Get-Item -LiteralPath $Path
+    $infoFolder = $script:Config.PatchInfoFolder
+    if (-not (Test-Path -LiteralPath $infoFolder)) { New-Item -ItemType Directory -Path $infoFolder -Force | Out-Null }
+    $stamp = '{0}|{1}' -f $file.Length, $file.LastWriteTimeUtc.Ticks
+    $cache = Join-Path $infoFolder ($file.Name + '.txt')
+
+    if (Test-Path -LiteralPath $cache) {
+        $h = @{}
+        foreach ($line in (Get-Content -LiteralPath $cache)) { if ($line -match '^([A-Za-z]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
+        if ($h['Stamp'] -eq $stamp -and $h['Hash'] -and $h.ContainsKey('TargetBuild') -and $h.ContainsKey('Signature')) {
+            return [pscustomobject]@{ TargetBuild = [int]$h['TargetBuild']; Signature = $h['Signature']; Signer = $h['Signer']; Hash = $h['Hash']; Source = $h['Source'] }
+        }
+    }
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $build = Read-PatchTargetBuild -Path $file.FullName
+    # Signature: must be Valid AND signed by Microsoft.  Works offline (the Microsoft roots are in Windows).
+    $sigStatus = 'Unknown'; $signer = ''
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop
+        $sigStatus = [string]$sig.Status
+        if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+        if ($sigStatus -eq 'Valid' -and $signer -notmatch 'O=Microsoft Corporation') { $sigStatus = 'ValidButNotMicrosoft' }
+    } catch {
+        $sigStatus = 'CheckFailed: ' + (Get-ShortError $_)
+    }
+    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    $secs = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+    Write-PatchLog ("  -> {0}: target build {1} = {2} (from {3}); signature {4}; SHA256 {5}...  ({6} s, cached in patches\_info)" -f $file.Name, $build.Build, (Get-OsNameForBuild -Build $build.Build), $build.Source, $sigStatus, $hash.Substring(0, 12), $secs) 'INFO'
+
+    @("Stamp=$stamp", "TargetBuild=$($build.Build)", "TargetOs=$(Get-OsNameForBuild -Build $build.Build)", "Source=$($build.Source)",
+      "Signature=$sigStatus", "Signer=$signer", "Hash=$hash", "File=$($file.Name)", "Read=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Set-Content -LiteralPath $cache
+    return [pscustomobject]@{ TargetBuild = $build.Build; Signature = $sigStatus; Signer = $signer; Hash = $hash; Source = $build.Source }
+}
+
+function Read-PatchTargetBuild {
+    # Which Windows build does this file target?  Read OFFLINE from inside the file with
+    # expand.exe (part of Windows), in well under a second.
+    #   .msu : the small .xml inside names every package with its version, e.g. 20348.5614.1.3;
+    #          pkgProperties.txt has Installer Version="10.0.20348.1960"; the bundled servicing
+    #          stack cab is called SSU-20348.xxxx-x64.cab.  Any of the three gives the build.
+    #   .cab : update.mum inside carries the package version.
+    # Returns @{ Build = <int, 0 = unknown>; Source = <where it was read from> }
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $file = Get-Item -LiteralPath $Path
+    $build = 0
+    $how = ''
+    $temp = Join-Path $script:Config.PatchInfoFolder ('tmp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        New-Item -ItemType Directory -Path $temp -Force | Out-Null
+        if ($file.Extension -eq '.msu') {
+            Write-PatchLog "expand.exe -F:*.xml `"$($file.FullName)`" `"$temp`"   (pulls one small file out of the MSU to read the target build)" 'CMD'
+            $null = & expand.exe -F:*.xml "$($file.FullName)" "$temp" 2>&1
+            $null = & expand.exe -F:*pkgProperties.txt "$($file.FullName)" "$temp" 2>&1
+            foreach ($xml in @(Get-ChildItem -LiteralPath $temp -Filter '*.xml' -ErrorAction SilentlyContinue)) {
+                $text = Get-Content -LiteralPath $xml.FullName -Raw
+                foreach ($m in [regex]::Matches($text, 'version="(\d{5})\.\d+\.\d+\.\d+"')) {
+                    if ($build -eq 0) { $build = [int]$m.Groups[1].Value; $how = $xml.Name }
+                }
+            }
+            if ($build -eq 0) {
+                foreach ($props in @(Get-ChildItem -LiteralPath $temp -Filter '*pkgProperties.txt' -ErrorAction SilentlyContinue)) {
+                    $text = Get-Content -LiteralPath $props.FullName -Raw
+                    if ($text -match 'Installer Version="10\.0\.(\d{5})\.') { $build = [int]$Matches[1]; $how = $props.Name }
+                }
+            }
+            if ($build -eq 0) {
+                $listing = (& expand.exe -D "$($file.FullName)" 2>&1) | Out-String
+                if ($listing -match 'SSU-(\d{5})\.') { $build = [int]$Matches[1]; $how = 'SSU cab name' }
+            }
+        } else {
+            Write-PatchLog "expand.exe -F:update.mum `"$($file.FullName)`" `"$temp`"" 'CMD'
+            $null = & expand.exe -F:update.mum "$($file.FullName)" "$temp" 2>&1
+            $mum = Join-Path $temp 'update.mum'
+            if (Test-Path -LiteralPath $mum) {
+                $text = Get-Content -LiteralPath $mum -Raw
+                if ($text -match 'version="(\d{5})\.\d+\.\d+\.\d+"') { $build = [int]$Matches[1]; $how = 'update.mum' }
+            }
+        }
+    } catch {
+        Write-PatchLog "Could not read the target build of $($file.Name): $(Get-ShortError $_)" 'WARN'
+    } finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($build -eq 0) { $how = 'not found' }
+    return @{ Build = $build; Source = $how }
+}
+
+function Test-PatchOsMismatch {
+    # $true when the file is for a different Windows build than the server runs.
+    #   Best    : TargetBuild read from inside the file  vs  the server's build (20348 = 2022, 17763 = 2019)
+    #   Fallback: the file-name line - "windows10.0" = Server 2016/2019/2022, "windows11.0" = Win11 / Server 2025
+    #             (cannot tell 2019 from 2022 - that is why an unknown build is blocked by default)
+    param($Status, $Patch)
+    if (-not $Status.Build) { return $false }
+    $major = 0
+    [void][int]::TryParse(($Status.Build -split '\.')[0], [ref]$major)
+    if ($major -eq 0) { return $false }
+    if ($Patch.TargetBuild -gt 0) {
+        $a = $Patch.TargetBuild; $b = $major
+        if ($a -in 22621, 22631 -and $b -in 22621, 22631) { return $false }   # Win11 22H2/23H2 share packages
+        return ($a -ne $b)
+    }
+    if (-not $Patch.OsLine) { return $false }
+    if ($Patch.OsLine -eq 'windows10.0' -and $major -ge 22000) { return $true }
+    if ($Patch.OsLine -eq 'windows11.0' -and $major -lt 22000) { return $true }
+    return $false
+}
+
+function Get-OsMismatchText {
+    # Human wording for the plan and the log.
+    param($Status, $Patch)
+    if ($Patch.TargetBuild -gt 0) {
+        return ("wrong OS - file is for {0} (build {1}), server is build {2}" -f $Patch.TargetOs, $Patch.TargetBuild, $Status.Build)
+    }
+    return ("wrong OS line - file is '{0}', server build is {1}" -f $Patch.OsLine, $Status.Build)
+}
+
+function Get-PatchVerdict {
+    # THE single "can this KB go on this server?" decision.  The grid cell (Get-PatchCellText)
+    # and the install plan (New-PatchPlan) both call it, so they can never disagree.
+    # Order: not checked / unreachable / already installed / pending reboot / busy servicing /
+    #        low disk / bad signature / OS unknown / wrong OS / READY
+    param($Status, $Patch)
+    $v = [pscustomobject]@{ Go = $false; Cell = ''; Reason = '' }
+    if (-not $Status)                                 { $v.Cell = 'not checked';         $v.Reason = 'not checked yet'; return $v }
+    if (-not $Status.Reachable)                       { $v.Cell = '?';                   $v.Reason = 'unreachable - see log'; return $v }
+    if ($Status.HotFixIDs -contains $Patch.KB)        { $v.Cell = 'Installed';           $v.Reason = 'already installed'; return $v }
+    if ($Status.HistoryInstalledKBs -contains $Patch.KB) { $v.Cell = 'Installed (history)'; $v.Reason = 'already installed (per Windows Update history)'; return $v }
+    if ($Status.PendingReboot)                        { $v.Cell = 'Blocked: reboot';     $v.Reason = "pending reboot ($($Status.RebootReasons)) - reboot first"; return $v }
+    if ($Status.ServicingActive)                      { $v.Cell = 'Blocked: servicing';  $v.Reason = "servicing already running on the server ($($Status.ServicingReasons)) - wait and re-check"; return $v }
+    if ($Status.FreeGB -lt $script:Config.MinFreeGB)  { $v.Cell = 'Blocked: disk';       $v.Reason = "low disk ($($Status.FreeGB) GB free on C:)"; return $v }
+    if ($script:Config.RequireValidSignature -and $Patch.Signature -ne 'Valid') { $v.Cell = 'Blocked: signature'; $v.Reason = "file signature is '$($Patch.Signature)' - not a valid Microsoft-signed package"; return $v }
+    if ($Patch.TargetBuild -le 0 -and -not $script:Config.AllowUnknownTargetBuild) { $v.Cell = 'Blocked: OS unknown'; $v.Reason = 'target build could not be read from inside the file - see patches\_info and the log'; return $v }
+    if (Test-PatchOsMismatch -Status $Status -Patch $Patch) { $v.Cell = 'Blocked: wrong OS'; $v.Reason = (Get-OsMismatchText -Status $Status -Patch $Patch); return $v }
+    $v.Go = $true; $v.Cell = 'READY'; $v.Reason = 'ready'
+    return $v
+}

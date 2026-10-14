@@ -1,0 +1,23 @@
+# The Patch Palace - things that must never go into the repository
+
+# Patch files are 500 MB+ and are downloaded from the Microsoft Update Catalog, not stored here
+patches/*.msu
+patches/*.cab
+patches/_info/
+
+# Logs contain server names and operator identities
+logs/
+
+# Server lists are site-specific; commit only the placeholder samples
+# (remove the next three lines if you DO want your real lists in the repo)
+PatchGroup-*.txt
+!PatchGroup-A.txt
+!PatchGroup-B.txt
+!PatchGroup-C.txt
+
+# Editor / OS noise
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+CODE-REVIEW.md

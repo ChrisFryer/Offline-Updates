@@ -1,0 +1,531 @@
+﻿# =====================================================================
+#  08-CodeTour.ps1  -  THE TRAINING CONTENT SHOWN IN THE "CODE TOUR" TAB
+# ---------------------------------------------------------------------
+#  Each entry = a Title, an Explain text, the name of the function (or
+#  script block variable) whose LIVE source is printed underneath, and
+#  optionally an Image (a PNG in images\, drawn by Build-Diagrams.ps1).
+#  "Live" means it is read from memory with Get-Command, so what you see
+#  is exactly what is running - even if somebody edited a file.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  REVIEW RECORD  -  08-CodeTour.ps1
+# ---------------------------------------------------------------------
+#  Independent review 2026-10-14 (see CODE-REVIEW.md).  Changed here:
+#  R-31 text that disagreed with the code (slice size 224 KB not 240,
+#  plan rule order, "press Reload" for config edits, "failed at" in
+#  all-in-one mode, Kerberos/FQDN/TrustedHosts wording) and new topics
+#  for the guards added by the review.  Text only - nothing here runs
+#  on a server.
+#  ---------------------------------------------------------------------
+#  HUMAN REVIEW  (fill in by hand and keep it in the file)
+#  Reviewer   : ____CF__________________________   Date : ___14-10-2026___________
+#  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
+#  Checked    : [x] every topic read against the live source it shows
+#  Comments   :
+#    -
+# =====================================================================
+
+$script:CodeTour = @(
+    [pscustomobject]@{ Title = '0. Start here - the big picture'; Source = ''; Explain = @'
+WHAT THIS TOOL DOES
+  1. Reads server lists  : every *.txt file in the root folder (PatchGroup-A.txt ...)
+  2. Reads patch files   : every .msu / .cab in \patches - KB from the name, target build,
+     Microsoft signature and SHA256 from inside the file (cached in patches\_info)
+  3. Asks each server over WinRM (TCP 5985): build, free disk, installed hotfixes,
+     Windows Update history, pending reboot, servicing in progress.
+     Shows per KB: Installed / READY / Blocked: <why>.
+  4. Installs a KB on ticked servers after THREE confirmations:
+     the plan, "VMware snapshot taken?", "Trellix in maintenance mode?".
+     Answer No to either safety question and nothing happens.
+
+THE FILES (root folder)
+  Start-OfflinePatcher.ps1   the launcher - checks the folder, loads lib\*.ps1 (explicit list)
+  lib\01-Config.ps1          settings + shared variables ($Config, $ServerStatus ...)
+  lib\02-Logging.ps1         Write-PatchLog: file + console + GUI, colour coded; audit identity
+  lib\03-Groups.ps1          Get-PatchGroups: parse the *.txt lists
+  lib\04-Patches.ps1         Get-PatchFiles : scan \patches, read build/signature/hash; Get-PatchVerdict
+  lib\05-WinRM.ps1           status check, credentials, Test-WSMan, the slice copy
+  lib\06-Install.ps1         safety pop-ups, plan, locked staging folder, DISM install, reboot
+  lib\07-Gui.ps1             the window you are looking at
+  lib\08-CodeTour.ps1        this text
+  Build-TextCopies.ps1       makes the .txt versions (code-as-text\ + the all-in-one)
+  Build-Diagrams.ps1         draws the pictures in images\
+  CODE-REVIEW.md             the independent review: every finding, what was done, sign-off
+  Every .ps1 starts with a REVIEW RECORD block with space for a human reviewer.
+
+RUNNING IT WITHOUT A GUI (handy for fault finding)
+  cd to the root folder, then in PowerShell 5.1 load the building blocks only:
+     $NoGui = $true
+     . .\Start-OfflinePatcher.ps1
+  (or, if .ps1 files are blocked:  $NoGui = $true; Invoke-Expression (Get-Content -Raw .\Offline-Patcher-AllInOne.txt))
+  then call any function by hand:
+     Get-PatchGroups; Get-PatchFiles
+     Get-ServerStatus -ComputerName SRV01     # everything is logged to logs\
+     $ServerStatus['SRV01'] | Format-List     # raw result
+     & $RemoteStatusScript $false             # run the remote status block on THIS machine
+     Show-PatcherGui                          # open the window when you are ready
+
+LOG LEVELS
+  CMD  = the exact command sent - copy it into a console to reproduce by hand
+  WHY  = the reasoning behind the next step
+  Every INSTALL / CONFIRM / RESULT / REBOOT line names the operator (audit trail).
+'@ }
+
+    [pscustomobject]@{ Title = '0a. PICTURE: the big picture'; Source = ''; Image = 'images\1-big-picture.png'; Explain = @'
+Who talks to whom.  Three machines matter: the INTERNET PC where the .msu is downloaded
+(any PC, the tool is not involved), the OPERATOR PC where this tool runs, and the TARGET
+SERVERS from the group files.  Only one connection is made by the tool: operator PC ->
+server on TCP 5985, WinRM over HTTP, authenticated with Kerberos (use FQDNs in the group
+files; an IP address forces NTLM and would need TrustedHosts - never set that to *).
+The domain controller is already in the picture for DNS and Kerberos; nothing new is
+opened.  The red box lists what the tool deliberately never uses, which is also the
+answer to "what do I need to allow through the firewall?": 5985 and nothing else.
+'@ }
+
+    [pscustomobject]@{ Title = '0b. PICTURE: ports and protocols'; Source = ''; Image = 'images\2-ports-and-protocols.png'; Explain = @'
+The table is the firewall conversation in one page.  Below it, the layers inside 5985
+from the outside in - HTTP, then the WS-Management SOAP envelope (whose size limit,
+MaxEnvelopeSizekb, is why files are copied in slices), then PSRP carrying our commands,
+then wsmprovhost.exe on the server actually running them.  The yellow box lists the
+only WinRM settings on a server that ever matter to this tool.
+'@ }
+
+    [pscustomobject]@{ Title = '1. Config - settings and shared state'; Source = 'Config'; Explain = @'
+$script:Config is a plain hashtable, filled when the tool starts.  To change a value for
+good, edit lib\01-Config.ps1 and start the tool again.  To try a value right now, type in
+the console behind the GUI, e.g.  $Config.MinFreeGB = 8  - it takes effect at the next
+status check.  "Reload lists + patches" re-reads the group files and \patches only.
+  WinRMPort 5985      -> the HTTP WinRM listener (5986 would be HTTPS)
+  OpenTimeoutSec      -> how long a silent server is given before we call it unreachable
+  MaxParallel         -> servers checked at the same time (ThrottleLimit)
+  RemoteStaging       -> folder created on the target where the .msu is copied (ACL locked down)
+  MinFreeGB           -> below this the install is refused (DISM needs room)
+  RequireValidSignature  -> the .msu must be Authenticode-signed by Microsoft (checked twice)
+  AllowUnknownTargetBuild -> off: a file whose build cannot be read is blocked
+  TreatPendingFileRenameAsReboot -> PendingFileRenameOperations is set by many
+                         installers and AV products; it is NOT counted as "pending
+                         reboot" unless you flip this to $true.
+  ProgressEverySec / InstallTimeoutMin -> the install wait loop
+Shared state: $script:Credential (memory only, cleared when the GUI closes),
+$script:ServerStatus (name -> last result), $script:Groups, $script:Patches,
+$script:Gui (the WinForms controls), $script:Operator (who is running the tool).
+'@ }
+
+    [pscustomobject]@{ Title = '1a. PICTURE: the folder on the operator PC'; Source = ''; Image = 'images\3-operator-folder.png'; Explain = @'
+Every file in the root folder and its one job.  lib\ is loaded in number order from an
+explicit list; patches\ is yours to fill; logs\ is written by the tool; the .txt twins and
+the all-in-one file exist for machines that block .ps1 scripts by ExecutionPolicy (not
+AppLocker - see topic 16).  The yellow box lists the variables you can inspect from the
+console while the GUI is open ($ServerStatus, $Patches, $Config ...).
+TRUST BOUNDARY: everything in this folder runs as you on every server.  Keep the folder
+writable only by the operators.
+'@ }
+
+    [pscustomobject]@{ Title = '2. Write-PatchLog - one log, three outputs'; Source = 'Write-PatchLog'; Explain = @'
+Every message goes to logs\Patcher-YYYYMMDD.log, to the console (colour) and to the
+GUI log box.  The GUI part calls Application.DoEvents() so the window repaints while
+a long job runs - that is the trick that keeps a single-threaded WinForms script alive.
+AUDIT: the session header and every INSTALL / CONFIRM / RESULT / REBOOT line carry the
+operator identity from Get-OperatorIdentity ("DOMAIN\user", plus "(WinRM as X)" when
+alternate credentials are in use).  Each install also writes Application event 900
+(source OfflinePatcher) and a result-*.txt on the server itself.  Passwords are never
+logged anywhere.
+FAULT FINDING: the log file is plain text; search for [ERROR] or for a server name.
+'@ }
+
+    [pscustomobject]@{ Title = '3. Get-PatchGroups - reading the server lists'; Source = 'Get-PatchGroups'; Explain = @'
+Any *.txt in the root folder is a candidate.  A line is a host name if it only has
+letters, digits, dots and dashes.  Comments start with #.  If ANY line fails that
+test the file is ignored (that is how the code-as-text copies are kept out).
+The file name without .txt is the group name shown in the Group drop-down.
+Names are de-duplicated case-insensitively (Get-UniqueNames), an IP address gets a
+warning (no Kerberos), and the same first label written two ways (SRV01 and
+srv01.corp.local) is flagged - the install de-duplicates again by the server's real
+name after the status check so one box is never patched twice at once.
+FAULT FINDING: a group missing from the drop-down?  Look for "Ignoring ... not a
+server list" in the log - it names the offending line.
+'@ }
+
+    [pscustomobject]@{ Title = '4. Get-PatchFiles - scanning \patches'; Source = 'Get-PatchFiles'; Explain = @'
+Looks for .msu and .cab files.  The KB number is pulled from the FILE NAME with the
+regex (KB\d{6,7}), so keep the Microsoft Update Catalog name, e.g.
+   windows10.0-kb5034770-x64_....msu   ->  KB5034770
+A file without a KB in its name is skipped with a warning - just rename it.
+For every file Get-PatchFileInfo reads, once, and caches in patches\_info\<file>.txt
+(re-read when the size or date changes):
+  TARGET BUILD   The name alone cannot say: Server 2016, 2019 and 2022 all use
+                 "windows10.0-kb..." names.  expand.exe pulls the small .xml out of the
+                 MSU (package versions like 20348.5614.1.3), or pkgProperties.txt
+                 (Installer Version="10.0.20348.x"), or the SSU cab name.  14393 = 2016,
+                 17763 = 2019, 20348 = 2022, 26100 = 2025.  Unknown = blocked, because
+                 the file-name fallback cannot tell 2019 from 2022.
+  SIGNATURE      Get-AuthenticodeSignature must say Valid AND the signer must be
+                 Microsoft, otherwise "Blocked: signature".  Works offline.
+  SHA256         used to verify the copy on the server and again right before DISM.
+Mixed groups are fine: put the 2019 and the 2022 cumulative updates in \patches
+together and each server gets a READY only in its own column.  DISM is the last line
+of defence anyway - it refuses a wrong package with 0x800F081E.
+This tool is OFFLINE: nothing is ever downloaded; you put the files there.
+'@ }
+
+    [pscustomobject]@{ Title = '4b. Finding this month''s patch (catalog how-to)'; Source = ''; Explain = $script:PatchHowTo }
+
+    [pscustomobject]@{ Title = '5. RemoteStatusScript - what runs ON the server'; Source = 'RemoteStatusScript'; Explain = @'
+This script block is shipped to each server by Invoke-Command and executed there.
+It must be self contained: it cannot see our functions or variables, only the
+parameter passed with -ArgumentList.  It is READ-ONLY.
+  Win32_OperatingSystem       -> caption, last boot time
+  HKLM\...\CurrentVersion     -> CurrentBuildNumber + UBR  = e.g. 20348.2322
+  Win32_LogicalDisk C:        -> free space
+  Get-HotFix                  -> installed KB list (primary "is it installed?" source).  Only CBS
+                                 packages still on disk: superseded cumulative updates drop off,
+                                 so expect a SHORT list (current LCU, SSU, .NET, a few more).
+  Microsoft.Update.Session    -> Windows Update Agent history = Settings > Update history.
+     QueryHistory               Every install attempt ever, newest first (80 shown).  Read from
+                                 the local database over COM, nothing goes online.  A KB whose
+                                 newest entry is a successful Install counts as installed too.
+  Registry keys               -> pending reboot.  HARD signs, always counted:
+                                 CBS\RebootPending, CBS\PackagesPending, CBS\RebootInProgress,
+                                 WU\RebootRequired, WU\PostRebootReporting, UpdateExeVolatile,
+                                 a pending computer rename.
+                                 WEAK sign, shown but not counted: PendingFileRenameOperations
+                                 (PFRO) = files to rename/delete at next boot because they were
+                                 locked.  AV products and installers add to it constantly and it
+                                 is often left behind, hence "no (PFRO only, ignored)" in the grid.
+  ServicingActive             -> somebody is servicing the box right now (another admin, Windows
+                                 Update, a previous run).  Blocks installs and reboots.  Counted:
+                                 dism.exe or wusa.exe running; TiWorker.exe ONLY while it is burning
+                                 CPU (sampled over 2 s - it idles for minutes after routine
+                                 maintenance, which is not servicing); the Windows Update agent's
+                                 own "installing" flag (IUpdateInstaller.IsBusy).  A "Blocked:
+                                 servicing" normally clears within a few minutes - re-check.
+  Both update lists are sent as pre-formatted text lines because PowerShell remoting
+  flattens nested objects to strings (serialization depth 1).
+  WHICH KB IS "THE" PATCH LEVEL?  None - the BUILD is.  The UBR (number after the dot in
+  20348.5622) changes with every cumulative update and only moves after the reboot.  The
+  "Newest hotfixes" column lists all Get-HotFix entries from the latest install date because
+  the cumulative update and the .NET cumulative update land on the same day with different KBs.
+Run it on THIS machine from the console to see the raw output:   & $RemoteStatusScript $false
+'@ }
+
+    [pscustomobject]@{ Title = '6. Get-ServerStatus - fan-out over WinRM'; Source = 'Get-ServerStatus'; Explain = @'
+One Invoke-Command with -ComputerName <many> -AsJob gives a parent job with one child
+job per server, all running at the same time (up to MaxParallel).  We wait with
+Wait-PatcherJob (which keeps the GUI alive and treats only Completed / Failed /
+Stopped / Disconnected as finished), then harvest each child:
+  * output received  -> reachable, store the object + Reachable/Error/Checked
+  * no output        -> unreachable, store the full error text (one line)
+If a server answered "Access is denied" and no credential is stored yet, the tool
+asks ONCE with Get-Credential (foreground) and retries just those servers.
+FAULT FINDING: the CMD line in the log shows exactly what was sent.  Typical errors:
+  "WinRM cannot complete the operation"  -> port 5985 blocked or service stopped
+  "Access is denied"                     -> account is not an admin on that server
+  "Kerberos ... "                        -> use the FQDN in the group file.  Do NOT "fix"
+                                            it with TrustedHosts=*; that turns off the
+                                            check that you are talking to the right server.
+'@ }
+
+    [pscustomobject]@{ Title = '6a. PICTURE: a status check, step by step'; Source = ''; Image = 'images\4-status-check.png'; Explain = @'
+Three lanes: operator PC, the wire, target server.  One Invoke-Command fans out to every
+server at once; on each server RemoteStatusScript reads the OS, build, disk, both update
+lists, the reboot flags and the servicing processes - read-only, 2-5 seconds - and one
+result object comes back per server.  The two branches at the bottom are the only things
+that ever go wrong at this stage: "Access is denied" (credential prompt, foreground) and
+"no answer" (grey row, Test-WSMan button).
+'@ }
+
+    [pscustomobject]@{ Title = '7. Credentials - foreground only'; Source = 'Get-PatcherCredential'; Explain = @'
+The tool never stores passwords on disk.  Get-Credential shows the standard Windows
+dialog in the foreground, in the logged-on user's context.  The dialog belongs to the
+console window, so it can appear BEHIND the GUI - the status bar says so, and the GUI is
+brought back to the front afterwards.  If you cancel, the tool keeps using your current
+Windows login (Kerberos single sign-on).  The credential is cleared from memory when the
+GUI closes, so nothing is left behind in a pasted / Invoke-Expression console.
+Get-ConnectionArgs builds the same -Port / -SessionOption / -Credential set for every
+call so all WinRM traffic is uniform.
+'@ }
+
+    [pscustomobject]@{ Title = '8. Test-ServerWinRM - the no-auth check'; Source = 'Test-ServerWinRM'; Explain = @'
+Test-WSMan sends a WS-Management "Identify" request.  WinRM answers it anonymously,
+which is why "winrm get/enumerate" style calls worked without credentials in testing.
+It proves: DNS resolves, TCP 5985 is open, the WinRM service is running.
+It does NOT prove you are allowed in - that needs Invoke-Command.
+'@ }
+
+    [pscustomobject]@{ Title = '9. Confirm-SafetyChecks - the two pop-ups'; Source = 'Confirm-SafetyChecks'; Explain = @'
+Pop-up 1: "Has a VMware snapshot been taken?"      Yes / No
+Pop-up 2: "Is Trellix in maintenance mode?"        Yes / No
+The default button is No, so pressing Enter by accident can never approve.
+Either No -> the function returns $false, Install-PatchOnServers returns without
+opening a single session, and an [ERROR] ABORTED line with the operator's name goes in
+the log.  With many servers the pop-up becomes a scrollable window with the same buttons.
+A LESSON FROM THE REVIEW: a MessageBox RETURNS the button pressed.  The first version
+showed an extra "Patching aborted" box without capturing its result, so the function
+returned @('OK', $false) - which PowerShell treats as TRUE - and the install went ahead
+after a No.  Every pop-up whose answer is not needed is now written  $null = Show-...
+and the caller checks for a real [bool] $true.  Watch for this pattern in any script.
+'@ }
+
+    [pscustomobject]@{ Title = '10. Get-PatchVerdict - can it be installed?'; Source = 'Get-PatchVerdict'; Explain = @'
+ONE function decides, and both the grid cell and the install plan call it, so they can
+never disagree.  For every (server, KB) pair, in this order:
+  not checked / unreachable      -> no verdict yet / "?"
+  KB in Get-HotFix               -> Installed
+  KB in Windows Update history   -> Installed (history)
+  pending reboot                 -> Blocked: reboot      (0x800F0922 territory otherwise)
+  dism / TiWorker / wusa running -> Blocked: servicing   (re-check in a minute)
+  free space < MinFreeGB         -> Blocked: disk
+  signature not Valid/Microsoft  -> Blocked: signature
+  target build unknown           -> Blocked: OS unknown  (unless AllowUnknownTargetBuild)
+  build does not match the server-> Blocked: wrong OS
+  otherwise                      -> READY
+New-PatchPlan turns the verdicts into the plan rows that are shown and logged.
+'@ }
+
+    [pscustomobject]@{ Title = '11. Install-PatchOnServers - the orchestration'; Source = 'Install-PatchOnServers'; Explain = @'
+  1. Fresh status check, duplicates by real computer name removed
+  2. New-PatchPlan, logged line by line
+  3. Plan pop-up (OK/Cancel)
+  4. Safety pop-up 1 - VMware snapshot        (strict: anything but a real $true aborts)
+  5. Safety pop-up 2 - Trellix maintenance mode
+  6. Status check AGAIN - the pop-ups may have been open for minutes; any pair that is
+     no longer READY is dropped.  Then, one server at a time: New-PSSession,
+     RemoteStagingScript (C:\PatchStaging must be a real folder owned by admins; ACL
+     locked to SYSTEM + Administrators), Copy-FileToSession ...
+  7. ... and the moment that server's copy is verified, Invoke-Command -Session -AsJob
+     starts RemoteInstallScript THERE - so server 1 is already installing while server 2
+     is being copied.  The file list, the expected SHA256 per file and the operator name
+     go along.
+  8. Poll the jobs, keep the GUI alive, and every ProgressEverySec (45 s) ask the servers
+     for a progress snapshot (Write-InstallProgress / RemoteProgressScript).  Collect one
+     result per KB.  TIMEOUT (InstallTimeoutMin): the job is NOT stopped and the session
+     is NOT closed - either would kill DISM half way.  The session is disconnected, the
+     result is logged as UNKNOWN, and the server keeps a result-*.txt for you.
+  9. Sessions closed (try/finally - never leaked), fresh status check, summary pop-up
+
+WHAT A GROUP RUN LOOKS LIKE (say 10 servers, one LCU)
+  * Copies are sequential: about 3 min each at the default MaxEnvelopeSizekb (30 min for
+    ten; raise the envelope on the servers and it is a few minutes in total).  Each server's
+    install starts as soon as its own copy is done, so by the time the last copy finishes
+    the first servers are usually complete.
+  * The log during the wait: ONE summary line every 45 s -
+      "12 min elapsed - 7 servers installing, dism.exe alive on 7: CBS progress 23%..81% (avg 55%) on 6 of them"
+    plus one line per server every ProgressDetailEveryMin (5 min).  With 3 servers or
+    fewer the per-server line appears every poll.  The Patch-o-meter shows the average.
+  * Then one RESULT line per server/KB, a fresh status check, and the summary pop-up.
+  * While all that runs, "Check status", "Check ALL shown", the WinRM test, the group
+    box and the log button still work (read-only); PATCH IT!, Reboot, Reload and the
+    credential buttons stay locked until the run finishes.
+'@ }
+
+    [pscustomobject]@{ Title = '11b. Copy-FileToSession - the file goes over in slices'; Source = 'Copy-FileToSession'; Explain = @'
+WHY NOT Copy-Item -ToSession?  Every WinRM request must fit inside the server's
+MaxEnvelopeSizekb (default 500 KB).  Copy-Item -ToSession in PowerShell 5.1 sends
+bigger requests and dies with "...exceeded the configured MaxEnvelopeSize quota".
+WHAT WE DO INSTEAD
+  1. Ask the server (RemoteFileInfoScript): is the file there, how big, and its
+     MaxEnvelopeSizekb.  Only when the sizes match is the remote file hashed.
+  2. Same size + same hash  -> nothing to copy.   Smaller -> resume from that byte.
+  3. Slice size = 65% of the envelope, shrunk by the Base64 overhead (x1.37), rounded
+     down to 16 KB: with the default 500 KB that is 224 KB per round trip.  Each slice is
+     Base64 text passed as an argument to RemoteWriteSliceScript, which appends it.
+  4. If the server still says "too big", the slice is halved and the copy resumes
+     (six attempts, then a clear error naming the last slice size).
+  5. Afterwards both sides hash the file; a mismatch DELETES the staged file and throws,
+     so the next run starts clean and nothing is ever installed from a bad copy.
+SPEED  A 560 MB LCU is ~2560 round trips; on a LAN that is a few minutes.  Raising
+MaxEnvelopeSizekb on the servers (winrm set winrm/config @{MaxEnvelopeSizekb="8192"})
+lets the tool use ~3.8 MB slices and the copy becomes many times faster.  The status
+bar shows MB sent and MB/s; the Patch-o-meter shows the percentage.
+SELF-TEST  Pass no -Session and it copies locally through the same code path:
+   Copy-FileToSession -Path .\patches\x.msu -Destination C:\Temp\x.msu -SliceKB 64
+'@ }
+
+    [pscustomobject]@{ Title = '11c. PICTURE: an install, step by step'; Source = ''; Image = 'images\5-install-flow.png'; Explain = @'
+The eight steps of PATCH IT!, left = operator PC, right = what runs on the server inside
+the WinRM session.  Step 2 is the only place a human says "go" (plan, snapshot, Trellix).
+Step 3 re-checks the servers and locks down the staging folder; 4 is the slice copy with
+its SHA256 check; 5 the guards (nothing else servicing, no pending reboot, hash and
+signature re-checked) then expand + DISM.  Step 6 is the 45-second progress poll, step 7
+the exit codes and the result file, step 8 the reboot button with its own guards.
+'@ }
+
+    [pscustomobject]@{ Title = '12. RemoteInstallScript - DISM on the server'; Source = 'RemoteInstallScript'; Explain = @'
+WHY NOT wusa.exe?  Windows Update Standalone Installer refuses to run inside a WinRM
+session (exit code 5 / 0x80070005).  DISM does not care.
+GUARDS, in order, before anything is touched (each one throws = that KB is "failed"):
+  1. dism.exe / TiWorker.exe / wusa.exe already running  -> somebody else is servicing
+  2. hard pending-reboot keys set                         -> reboot first
+  3. SHA256 of the staged file == the hash we copied       -> nobody swapped the file
+  4. Get-AuthenticodeSignature Valid and signed by Microsoft (RequireValidSignature)
+THEN
+  expand.exe -F:* file.msu C:\PatchStaging\extract-KBxxxx-abcdef\   (unpack the container;
+     the 6-char suffix comes from the file name so two files with one KB never collide)
+  dism.exe /Online /Add-Package /PackagePath:<the .cab> /NoRestart /Quiet /LogPath:...
+WSUSSCAN.cab is skipped (metadata only).  If a separate SSU cab exists it goes first.
+A plain .cab in \patches is passed straight to DISM.
+EXIT CODES (also in the log, one line per package):
+  0           installed, no reboot needed
+  3010        installed, REBOOT REQUIRED  (success!)
+  0x800F081E  NOT APPLICABLE - wrong Windows build or missing prerequisite (failure)
+  0x800F0922  failed - usually pending reboot, missing SSU, or full System Reserved partition
+  anything else -> the last Error lines of the DISM log are copied into our log
+If the SSU went in and the LCU then failed, the message starts with "PARTIAL" and lists
+the packages that did install.
+WHAT "STILL GOING" LOOKS LIKE  The DISM log (C:\PatchStaging\dism-KBxxxx-*.log) shows the
+SSU install, then the LCU start, then "CBS session options=0x100!" - and then NOTHING for
+the whole install, which is 10-30 minutes.  That silence is normal: CBS is doing the work
+and writes its progress to C:\Windows\Logs\CBS\CBS.log as "Percent progress: NN".  The
+tool reads that line every 45 s and logs it, together with whether dism.exe and TiWorker
+are still busy.  To check by hand on the server:
+   Get-Process dism, TiWorker
+   Get-Content C:\Windows\Logs\CBS\CBS.log -Tail 3000 | Select-String 'Percent progress' | Select-Object -Last 1
+AFTERWARDS the server writes C:\PatchStaging\result-KBxxxx-*.txt and Application event
+900 (source OfflinePatcher) with the operator, KB and result - so the outcome survives a
+lost connection.  On success the staged file and extract folder are deleted
+(CleanupStaging); on failure they are kept, together with the DISM log, for you.
+If DISM dies with an out-of-memory style error, raise the WinRM shell quota on the
+target:   winrm set winrm/config/winrs @{MaxMemoryPerShellMB="4096"}
+'@ }
+
+    [pscustomobject]@{ Title = '12a. PICTURE: what lands on the target server'; Source = ''; Image = 'images\6-endpoint-layout.png'; Explain = @'
+Everything you will find on an endpoint during and after a patch: C:\PatchStaging\ and
+what is inside the extracted MSU, the DISM log, the result file and the CBS log, the
+registry keys the reboot flags and the build come from, the process chain while DISM
+runs, the Application event the tool writes, and the two WinRM settings on the server
+that matter.  Use it when you RDP to a server to look.
+'@ }
+
+    [pscustomobject]@{ Title = '13. Restart-PatchedServers - reboot button'; Source = 'Restart-PatchedServers'; Explain = @'
+Never automatic, and no longer "reboot whatever is ticked":
+  1. A fresh status check of the ticked servers (duplicates removed).
+  2. Servers that are PENDING A REBOOT are listed in a Yes/No pop-up (default No).
+  3. Servers that are NOT pending a reboot are listed in a SECOND pop-up and need their
+     own explicit Yes - they are never rebooted by accident alongside the others.
+  4. On each server RemoteRebootScript refuses while servicing is really happening: dism or
+     wusa running, TiWorker actively using CPU, or the Windows Update agent installing (a
+     reboot in the middle of CBS servicing is how a server ends up half patched), then
+     schedules the restart with shutdown.exe /r /t 10 so the call returns before the
+     connection drops - which is why the old Restart-Computer call sometimes logged
+     "failed" for a server that was in fact rebooting.
+Every REBOOT line in the log names the operator.  The stored status for that server is
+thrown away because it is now stale.
+'@ }
+
+    [pscustomobject]@{ Title = '14. The GUI - Show-PatcherGui'; Source = 'Show-PatcherGui'; Explain = @'
+Plain Windows Forms, no designer, no XAML.  Controls are kept in $script:Gui so the
+helper functions can reach them.  Docking order matters: the Fill control is added
+first, then Right/Top/Bottom edges, then BringToFront() on the Fill control.
+Every button goes through Invoke-GuiAction: disable the state-changing buttons -> run ->
+catch errors into the log -> re-enable -> refresh the grid -> new quip.  So a crash in a
+button never kills the window; it shows up as [ERROR] with the line that failed.
+READ-ONLY buttons (status checks, WinRM test, tick/untick, log, patches folder) are
+tagged -ReadOnly and stay enabled during an install: the install's wait loop pumps the
+message queue (DoEvents), the click arrives in the middle of it, and Invoke-GuiAction
+runs the read-only action nested, without touching the busy flag.  One nested action at
+a time.  So the operator can check whether a rebooted server is back while the group installs.
+While an action runs the window refuses to close (FormClosing) and the details window
+does not open - closing mid-install would abandon sessions and DISM.
+When the GUI closes, any stored credential is cleared from memory.
+Self-test from the console:  $f = Show-PatcherGui -NoShow   (builds the form, no window)
+'@ }
+
+    [pscustomobject]@{ Title = '15. Update-ServerList - the grid'; Source = 'Update-ServerList'; Explain = @'
+Rebuilds the ListView from three things: $script:Groups (rows), $script:Patches
+(one column per KB) and $script:ServerStatus (cell values via Get-PatchVerdict).
+Ticks survive a rebuild.  Row colour: white = not checked, grey = unreachable (hover =
+reason), pink = pending reboot, yellow = something READY, green = everything installed.
+'@ }
+
+    [pscustomobject]@{ Title = '16. Troubleshooting checklist'; Source = ''; Explain = @'
+GRID SHOWS "FAILED" FOR A SERVER
+  1. Tick it, press "Test WinRM port (no auth)".  No answer -> network/firewall/service:
+       on the server:  winrm quickconfig ; Get-Service WinRM
+  2. Answers but status fails with Access is denied -> "Set credentials" (admin account).
+  3. Kerberos errors -> use the FQDN in the group file.  Never set TrustedHosts=*.
+  4. Hover the grey row: the tooltip is the error.  Full text in the log.
+
+A SERVER 2019 BOX SHOWS "READY" FOR A SERVER 2022 PATCH
+  Should not happen: the target build is read from inside the file and compared with
+  the server build; an unreadable build is blocked.  If it does, check patches\_info\<file>.txt
+  and the log line for that file.
+
+TWO SERVERS SHOW DIFFERENT "NEWEST HOTFIX" KBs BUT THE SAME BUILD
+  Compare the Build column, not the KB.  Same build = same cumulative update level.  A server
+  patched by Windows Update also got the .NET cumulative update that day, so its newest entry
+  may be the .NET KB; a server patched by this tool only got the one file you gave it.
+
+"NO (PFRO ONLY, IGNORED)" IN THE PENDING REBOOT COLUMN
+  No hard reboot flag is set, but PendingFileRenameOperations exists.  Double-click the server
+  to see the file paths.  Temp or anti-virus files: ignore.  Windows servicing files: reboot.
+
+"BLOCKED: SERVICING"  /  "REBOOT ... refused: servicing still running"
+  dism or wusa is running, TiWorker is actively using CPU, or the Windows Update agent says it
+  is installing.  Another admin, Windows Update, or a previous run that timed out.  Wait a few
+  minutes and try again; on the server:  Get-Process dism, TiWorker, wusa | Select Name, CPU
+  (an idle TiWorker - CPU not climbing - no longer blocks anything).
+
+ONLY A FEW HOTFIXES ARE LISTED
+  Normal.  Get-HotFix shows CBS packages still present; each cumulative update replaces the
+  one before it.  Double-click the server: the details window shows both Get-HotFix AND the
+  full Windows Update history, with dates, results and titles.
+
+INSTALL FAILS
+  * 0x800F0922 -> reboot the server first, then retry.  Check the SSU is included.
+  * "staging failed" -> copy problem: free space on C:, the folder's owner/ACL, or the session dropped.
+    "...exceeded the configured MaxEnvelopeSize quota" -> a request was bigger than the
+    server allows; the tool halves its slice size and retries by itself.  The
+    "failed at:" line under every error names the file and line of our code (in all-in-one
+    mode it reads "<No file>: line N", counted from the top of the all-in-one text).
+  * "signature check failed" -> the file is not the Microsoft original.  Download it again.
+  * "staged file hash changed" -> something modified the file on the server between the copy
+    and the install.  Investigate before retrying.
+
+THE RESULT SAYS "UNKNOWN - still running on the server"
+  The wait hit InstallTimeoutMin.  DISM was NOT killed.  Look on the server:
+    Get-Process dism, TiWorker ;  Get-Content C:\PatchStaging\result-*.txt
+    Get-PSSession -ComputerName <server> | Connect-PSSession
+  When the result file says Success=True, run a status check; the row goes pink, reboot.
+
+NOTHING HAPPENS WHEN I CLICK / THE WINDOW WILL NOT CLOSE
+  The status bar says what it is busy with.  Buttons are disabled on purpose while a
+  job runs, and the window refuses to close until the action finishes.  The console
+  window behind the GUI shows the same log in colour.
+
+THE INSTALL SEEMS STUCK
+  It almost never is.  Watch for the progress lines every 45 s: "CBS stage 1 out of 1 at
+  NN%".  As long as the percentage moves or TiWorker CPU seconds keep climbing, wait.
+  Only if dism.exe is gone, TiWorker CPU stops climbing AND the percentage is frozen for
+  10+ minutes should you look at C:\Windows\Logs\CBS\CBS.log on the server.
+
+"POWERSHELL IS IN CONSTRAINEDLANGUAGE MODE"
+  AppLocker / WDAC is blocking scripts on this PC.  The .txt copies cannot help with that
+  (only with ExecutionPolicy).  Run the tool from a PC where PowerShell is in FullLanguage.
+
+I WANT TO RUN A STEP BY HAND
+  Open PowerShell in the root folder, set $NoGui = $true and dot-source the launcher (see
+  topic 0), then call any function: Get-ServerStatus, Test-ServerWinRM, New-PatchPlan ...
+'@ }
+)
+
+function Get-CodeTourText {
+    # Explanation + live source for one tour entry.
+    param($Entry)
+    $text = $Entry.Explain.TrimEnd()
+    $src = ''
+    switch ($Entry.Source) {
+        ''                    { $src = '' }
+        'Config'              { $src = ($script:Config.GetEnumerator() | Sort-Object Name | ForEach-Object { '  {0,-32} = {1}' -f $_.Name, $_.Value }) -join "`r`n" }
+        'RemoteStatusScript'  { $src = '$script:RemoteStatusScript = {' + $script:RemoteStatusScript.ToString() + '}' }
+        'RemoteInstallScript' { $src = '$script:RemoteInstallScript = {' + $script:RemoteInstallScript.ToString() + '}' }
+        default {
+            $fn = Get-Command -Name $Entry.Source -CommandType Function -ErrorAction SilentlyContinue
+            if ($fn) { $src = "function $($Entry.Source) {" + $fn.Definition + '}' } else { $src = "(function $($Entry.Source) is not loaded)" }
+        }
+    }
+    if ($src) {
+        $text += "`r`n`r`n" + ('-' * 78) + "`r`n LIVE SOURCE: $($Entry.Source)   (read from memory right now)`r`n" + ('-' * 78) + "`r`n" + $src
+    }
+    return ($text -replace "(?<!`r)`n", "`r`n")
+}

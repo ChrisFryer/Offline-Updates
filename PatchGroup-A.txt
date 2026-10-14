@@ -1,0 +1,8 @@
+# PatchGroup-A.txt  -  one server per line (short name or FQDN).
+# Lines starting with # are comments. Text after a # on a server line is a comment too.
+# The file name (without .txt) is the group name shown in the GUI.
+# Any *.txt in this folder whose lines all look like host names becomes a group.
+#
+# Examples (remove the # to activate):
+# SRV-APP01            # finance app
+# SRV-APP02.corp.local
