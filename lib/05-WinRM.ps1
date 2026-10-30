@@ -31,7 +31,7 @@
 #  GUI (form is re-activated afterwards).
 #  ---------------------------------------------------------------------
 #  HUMAN REVIEW  (fill in by hand and keep it in the file)
-#  Reviewer   : ____CF__________________________   Date : ___14-10-2026___________
+#  Reviewer   : ____CF__________________________   Date : ___30-10-2026___________
 #  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
 #  Checked    : [x] read every function   [x] ran a status check   [x] ran a copy
 #               [x] compared with CODE-REVIEW.md
@@ -48,7 +48,7 @@
 #  exist on the remote side, only what is passed via -ArgumentList.
 # ---------------------------------------------------------------------
 $script:RemoteStatusScript = {
-    param([bool]$TreatPfroAsReboot)
+    param([bool]$TreatPfroAsReboot, [string]$Staging = '')
     $ErrorActionPreference = 'Stop'
 
     # Operating system, build and last boot
@@ -56,6 +56,10 @@ $script:RemoteStatusScript = {
     $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $ubr = $cv.UBR
     if (-not $ubr) { $ubr = 0 }
+
+    # Hardware: the Software console deploys VMware Tools to VMware virtual machines only
+    $hw = $null
+    try { $hw = Get-CimInstance -ClassName Win32_ComputerSystem } catch { }
 
     # Free space on C: (patches need room to stage and install)
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
@@ -84,7 +88,7 @@ $script:RemoteStatusScript = {
     $hotfixLines = @($hotfixes | Sort-Object InstalledOn -Descending | ForEach-Object {
         $d = 'unknown date'
         if ($_.InstalledOn) { $d = $_.InstalledOn.ToString('yyyy-MM-dd') }
-        '{0,-10}  {1,-12}  {2,-24}  {3}' -f $_.HotFixID, $d, $_.Description, $_.InstalledBy
+        '{0,-10}  {1,-12}  {2,-24}  {3}' -f $_.HotFixID, $d, $(if ($_.Description) { $_.Description } else { '-' }), $_.InstalledBy   # '-': a blank column would merge
     })
 
     $historyLines = @()
@@ -114,7 +118,8 @@ $script:RemoteStatusScript = {
                 if ([int]$entry.Operation -eq 2) { $op = 'Uninstall' }
                 $when = ''
                 if ($entry.Date) { $when = ([datetime]$entry.Date).ToLocalTime().ToString('yyyy-MM-dd HH:mm') }
-                $historyLines += '{0,-16}  {1,-9}  {2,-18}  {3,-10}  {4}' -f $when, $op, $result, $kb, $entry.Title
+                # '-' for an empty field: the reader splits on two or more spaces, so a blank column would merge into its neighbour
+                $historyLines += '{0,-16}  {1,-9}  {2,-18}  {3,-10}  {4}' -f $(if ($when) { $when } else { '-' }), $op, $result, $(if ($kb) { $kb } else { '-' }), $entry.Title
                 # newest entry per KB decides whether it counts as installed
                 if ($kb -and -not $seen.ContainsKey($kb)) {
                     $seen[$kb] = $true
@@ -148,6 +153,47 @@ $script:RemoteStatusScript = {
     }
     if ($pfroPresent -and $TreatPfroAsReboot) { $reasons += 'PendingFileRenameOperations' }
 
+    # The toolkit's own software runs since the last boot whose installer asked for a reboot (exit 3010 / 1641): the
+    # reboot was suppressed, and an installer that does so often sets none of the flags above.  The run left a result
+    # file per item in <staging>\software.  Kept apart from PendingReboot on purpose: the reboot is due, but it must not
+    # block the OS patches - they go first and the one reboot finishes both.
+    # A removal since the last boot that did not ask for a reboot still leaves the reboot ADVISED (non-critical): an
+    # uninstaller often leaves a service marked for deletion or files to delete at the next start, which only a reboot
+    # finishes.  Advised blocks nothing and never reboots anything; the reboot stays the operator's own step.
+    $swReboot = @(); $swAdvised = @(); $swLate = @()
+    if ($Staging) {
+        $swDir = $Staging.TrimEnd('\') + '\software'
+        foreach ($f in @(Get-ChildItem -LiteralPath $swDir -Filter 'result-*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $os.LastBootUpTime } | Sort-Object LastWriteTime)) {
+            $h = @{}
+            foreach ($l in @(Get-Content -LiteralPath $f.FullName -TotalCount 12 -ErrorAction SilentlyContinue)) { if ($l -match '^([^=]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
+            if ($h['RebootRequired'] -eq 'True') { $swReboot += ('{0} (exit {1})' -f $h['Item'], $h['ExitCode']) }
+            elseif ($h['Kind'] -eq 'uninstall' -and $h['Success'] -eq 'True') { $swAdvised += ([string]$h['Item'] -replace '^Remove ', '') }
+        }
+        # a software task that outlived the tool's watch (SoftwareTimeoutMin) has no result file until the next software run
+        # on this server collects it: its exit code goes back as SoftwareLate (the toolkit PC adds it to its change log), and
+        # a 3010 since the last boot is a pending reboot just the same (read only; nothing is written here, R6-C03)
+        try {
+            foreach ($t in @(Get-ScheduledTask -TaskPath '\WinRMToolkit\' -ErrorAction Stop | Where-Object { $_.TaskName -like 'WRT-*' -and [string]$_.State -ne 'Running' })) {
+                if (Test-Path -LiteralPath ($swDir + '\result-' + $t.TaskName + '.txt')) { continue }
+                $ti = $t | Get-ScheduledTaskInfo -ErrorAction Stop
+                if (-not $ti.LastRunTime -or [int64]$ti.LastTaskResult -in 267009, 267011) { continue }   # still finishing, or never ran
+                $item = $t.TaskName
+                $meta = $swDir + '\task-' + $t.TaskName + '.txt'
+                if (Test-Path -LiteralPath $meta) { $hit = @(Get-Content -LiteralPath $meta -ErrorAction SilentlyContinue | Where-Object { $_ -like 'Item=*' }); if ($hit.Count -gt 0) { $item = $hit[0].Substring(5) } }
+                $swLate += ('{0}|{1}|{2}' -f $t.TaskName, [int64]$ti.LastTaskResult, ($item -replace '\|', '/'))
+                if ($ti.LastRunTime -le $os.LastBootUpTime -or [int64]$ti.LastTaskResult -notin 3010, 1641) { continue }
+                $swReboot += ('{0} (exit {1}, finished after the tool stopped watching)' -f $item, $ti.LastTaskResult)
+            }
+        } catch { }
+        # the same task once a later software run's sweep has collected it: that sweep writes the result file with Late=True
+        # (dated when the task ran), so the exit code still reaches the toolkit PC - which adds only what its change log lacks
+        foreach ($f in @(Get-ChildItem -LiteralPath $swDir -Filter 'result-*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) })) {
+            $h = @{}
+            foreach ($l in @(Get-Content -LiteralPath $f.FullName -TotalCount 14 -ErrorAction SilentlyContinue)) { if ($l -match '^([^=]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
+            if ($h['Late'] -eq 'True' -and $h['TaskName'] -and $h['ExitCode']) { $swLate += ('{0}|{1}|{2}' -f $h['TaskName'], $h['ExitCode'], ([string]$h['Item'] -replace '\|', '/')) }
+        }
+    }
+
     # Is somebody servicing this box RIGHT NOW?  (another admin, Windows Update, a previous run)
     # dism.exe / wusa.exe present = yes.  TiWorker.exe alone is NOT enough: it idles for minutes after routine
     # maintenance, so it only counts while it is actually burning CPU (sampled over 2 s), and the Windows
@@ -161,9 +207,78 @@ $script:RemoteStatusScript = {
         if (($cpu2 - $cpu1) -ge 0.25) { $busy += ('TiWorker busy ({0:N1} s CPU in 2 s)' -f ($cpu2 - $cpu1)) }
     }
     try { if ((New-Object -ComObject 'Microsoft.Update.Session').CreateUpdateInstaller().IsBusy) { $busy += 'Windows Update agent installing' } } catch { }
+    # the toolkit's own install or software task (another operator's run, or a software install that outlived its watch):
+    # expand.exe runs before dism.exe does, and a task of the tool's folder that is Running is an install in progress
+    if (@(Get-Process -Name expand -ErrorAction SilentlyContinue).Count -gt 0) { $busy += 'expand.exe unpacking an update' }
+    try { $tk = @(Get-ScheduledTask -TaskPath '\WinRMToolkit\' -ErrorAction Stop | Where-Object { [string]$_.State -eq 'Running' } | ForEach-Object { $_.TaskName }); if ($tk.Count -gt 0) { $busy += ('toolkit task running: ' + ($tk -join ', ')) } } catch { }
+
+    # Trellix Solidcore (Application Control).  A Solidifier that is ENFORCING ("Enabled") when the server reboots rolls
+    # the update back: poqexec.exe applies the pending operations at boot and its writes are denied (field test, October
+    # 2026: CBS.log full of poqexec errors, the patch gone after the reboot).  "sadmin status" is the one command the CLI
+    # still answers in lockdown; its lines are sent as they are and read on the operator side (Get-SolidcoreInfo).
+    # Read-only: the tool never changes the mode - the Update Mode task in ePO does that.
+    $scPresent = $false; $scLines = @(); $scError = ''
+    $sadmin = $null
+    foreach ($p in @("$env:ProgramFiles\McAfee\Solidcore\sadmin.exe", "$env:ProgramFiles\Trellix\Solidcore\sadmin.exe", 'C:\Program Files\McAfee\Solidcore\sadmin.exe')) { if (-not $sadmin -and (Test-Path -LiteralPath $p)) { $sadmin = $p } }
+    if ($sadmin) {
+        $scPresent = $true
+        try {
+            # a native command's stderr under $ErrorActionPreference = 'Stop' would end the whole status check: Continue inside
+            $scLines = @(& { $ErrorActionPreference = 'Continue'; & $sadmin status 2>&1 } | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() } | Select-Object -First 40)
+            if ($scLines.Count -eq 0) { $scError = 'sadmin status printed nothing' }
+        } catch { $scError = 'sadmin status failed: ' + $_.Exception.Message }
+    } elseif (Get-Service -Name scsrvc -ErrorAction SilentlyContinue) { $scPresent = $true; $scError = 'the Solidcore service (scsrvc) exists but sadmin.exe was not found under Program Files' }
+
+    # The Trellix Agent (ePO agent): masvc "Trellix Agent Service" and macmnsvc "Trellix Agent Common Services".  The field
+    # test (October 2026) found an OS patch install only completes with both Disabled and stopped, so the tool shows
+    # their state (the Trellix Agent column; stopped = a warning, ePO hears nothing from the server) and can set them to
+    # Disabled + stopped before an install and to Automatic + running after the reboot (06-Install, RemoteTrellixAgentScript).
+    #   TrellixAgentLines 'Name|DisplayName|State|StartMode'   (empty = the agent is not on the server)
+    #   TrellixAgentError  why the services could not be read (then the state is unknown, never "not on the server")
+    $taLines = @(); $taError = ''
+    try { foreach ($ws in @(Get-CimInstance -ClassName Win32_Service -Filter "Name='masvc' OR Name='macmnsvc'" -ErrorAction Stop)) { $taLines += '{0}|{1}|{2}|{3}' -f $ws.Name, $ws.DisplayName, $ws.State, $ws.StartMode } } catch { $taError = 'the services could not be read: ' + $_.Exception.Message }
+
+    # OS patch runs the toolkit handed to this server as tasks (06-Install): the run markers, the tasks and the result
+    # files of the last 14 days, so a status check finishes the record of a run the operator left to itself.
+    #   PatchRuns    'Stamp|TaskState|LastResult|Started|Finished'
+    #   PatchResults 'Stamp|KB|When|Success|RebootRequired|ExitCode|Message|File'
+    $patchRuns = @(); $patchResults = @(); $patchRunsError = ''   # the error text when the run records could not be read: "no record" is then not known
+    if ($Staging -and (Test-Path -LiteralPath $Staging)) {
+        try {
+            $taskStates = @{}
+            $tasksUnread = $false   # the task list could not be read: every run says 'unread' (still running, as far as anyone knows), never 'absent'
+            try {
+                foreach ($tk in @(Get-ScheduledTask -TaskPath '\WinRMToolkit\' -ErrorAction Stop | Where-Object { $_.TaskName -like 'OSPatch-*' })) {
+                    $tkLast = ''; try { $tkLast = [string]($tk | Get-ScheduledTaskInfo -ErrorAction Stop).LastTaskResult } catch { $tkLast = '?' }
+                    $taskStates[$tk.TaskName.Substring(8)] = @([string]$tk.State, $tkLast)
+                }
+            } catch { if ([string]$_.CategoryInfo.Category -ne 'ObjectNotFound') { $tasksUnread = $true } }   # no \WinRMToolkit\ folder yet = no tasks
+            foreach ($rf in @(Get-ChildItem -LiteralPath $Staging -Filter 'run-*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) })) {
+                $st = $rf.BaseName.Substring(4)
+                $started = ''; $finished = ''
+                foreach ($l in @(Get-Content -LiteralPath $rf.FullName -ErrorAction SilentlyContinue)) { if ($l -match '^Started=(.*)$') { $started = $Matches[1] } elseif ($l -match '^Finished=(.*)$') { $finished = $Matches[1] } }
+                $ts = 'absent'; $tkLast = ''; if ($taskStates.ContainsKey($st)) { $ts = $taskStates[$st][0]; $tkLast = $taskStates[$st][1] } elseif ($tasksUnread) { $ts = 'unread' }
+                # a finished run's task has done its work: removed here (the result files and the run marker are the record)
+                if ($finished -and $ts -notin 'Running', 'absent', 'unread') { try { Unregister-ScheduledTask -TaskName ('OSPatch-' + $st) -TaskPath '\WinRMToolkit\' -Confirm:$false -ErrorAction Stop; $ts = 'removed' } catch { } }
+                $patchRuns += '{0}|{1}|{2}|{3}|{4}' -f $st, $ts, $tkLast, $started, $finished
+            }
+            foreach ($rf in @(Get-ChildItem -LiteralPath $Staging -Filter 'result-*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) })) {
+                $h = @{}
+                foreach ($l in @(Get-Content -LiteralPath $rf.FullName -ErrorAction SilentlyContinue)) { if ($l -match '^([^=]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
+                if (-not $h['Run']) { continue }
+                $patchResults += '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $h['Run'], $h['KB'], $h['When'], $h['Success'], $h['RebootRequired'], $h['ExitCode'], ([string]$h['Message'] -replace '\|', '/'), $h['File']
+            }
+        } catch { $patchRunsError = $_.Exception.Message }
+    }
+    # patch files already on the server (STAGE ONLY, or kept by an earlier run): "name|bytes", so the grid says READY (staged)
+    $staged = @()
+    if ($Staging -and (Test-Path -LiteralPath $Staging)) { foreach ($sf in @(Get-ChildItem -LiteralPath $Staging -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.msu', '.cab' })) { $staged += '{0}|{1}' -f $sf.Name, $sf.Length } }
 
     [pscustomobject]@{
         Computer      = $env:COMPUTERNAME
+        DnsDomain     = $(try { [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName } catch { '' })
+        Manufacturer  = $(if ($hw) { [string]$hw.Manufacturer } else { '' })
+        Model         = $(if ($hw) { [string]$hw.Model } else { '' })
         Caption       = $os.Caption
         Build         = '{0}.{1}' -f $cv.CurrentBuildNumber, $ubr
         LastBoot      = $os.LastBootUpTime
@@ -171,11 +286,24 @@ $script:RemoteStatusScript = {
         FreeGB        = [math]::Round($disk.FreeSpace / 1GB, 1)
         PendingReboot = ($reasons.Count -gt 0)
         RebootReasons = ($reasons -join ', ')
+        SoftwareRebootPending = ($swReboot.Count -gt 0)
+        SoftwareRebootReasons = ($swReboot -join '; ')
+        RebootAdvised = ($swAdvised.Count -gt 0)
+        RebootAdvisedReasons = ($swAdvised -join '; ')
+        SoftwareLate  = $swLate
         PfroPresent   = $pfroPresent
         PfroEntries   = $pfroEntries
         PfroCount     = @($pfro | Where-Object { $_ }).Count
         ServicingActive  = ($busy.Count -gt 0)
         ServicingReasons = ($busy -join ', ')
+        SolidcorePresent = $scPresent
+        SolidcoreLines   = $scLines
+        SolidcoreError   = $scError
+        TrellixAgentLines = $taLines
+        TrellixAgentError = $taError
+        PatchRuns     = $patchRuns; PatchRunsError = $patchRunsError
+        PatchResults  = $patchResults
+        StagedFiles   = $staged
         HotFixIDs     = @($hotfixes | ForEach-Object { $_.HotFixID })
         HotFixLines   = $hotfixLines
         HistoryInstalledKBs = $historyInstalled
@@ -209,7 +337,7 @@ function Get-PatcherCredential {
     param([string]$Reason = 'alternate credentials for WinRM')
     Write-PatchLog "Prompting for credentials in the foreground: $Reason  (look for the Windows credential dialog - it may be behind this window)" 'WHY'
     Set-GuiStatus 'Credential prompt open - it may be behind this window'
-    $cred = Get-Credential -Message "Offline Patcher - $Reason" -UserName "$env:USERDOMAIN\"
+    $cred = Get-Credential -Message "$($script:Config.ToolName) - $Reason" -UserName "$env:USERDOMAIN\"
     $form = $script:Gui['Form']
     if ($form -and -not $form.IsDisposed) { try { $form.Activate() } catch { } }
     if ($cred -and $cred.UserName -and $cred.UserName -ne "$env:USERDOMAIN\") {
@@ -253,8 +381,7 @@ function Get-ShortError {
 }
 
 function Get-ErrorLocation {
-    # "file.ps1: line 123" for a caught error.  In all-in-one (Invoke-Expression) mode there is no
-    # file, so it reads "<No file>: line N" where N counts from the top of the all-in-one text.
+    # "file.ps1: line 123" for a caught error: the first line of its script stack trace.
     param($ErrorRecord)
     if ($ErrorRecord.ScriptStackTrace) { return (($ErrorRecord.ScriptStackTrace -split "`r?`n")[0] -replace '^at ', '') }
     return ''
@@ -264,9 +391,9 @@ function New-UnreachableStatus {
     # Same shape as the remote object so the GUI never trips over a missing property.
     param([string]$ComputerName, [string]$Reason)
     return [pscustomobject]@{
-        Computer = $ComputerName; Caption = ''; Build = ''; LastBoot = $null; UptimeDays = $null
-        FreeGB = $null; PendingReboot = $false; RebootReasons = ''; PfroPresent = $false; PfroEntries = @(); PfroCount = 0
-        ServicingActive = $false; ServicingReasons = ''
+        Computer = $ComputerName; Manufacturer = ''; Model = ''; Caption = ''; Build = ''; LastBoot = $null; UptimeDays = $null
+        FreeGB = $null; PendingReboot = $false; RebootReasons = ''; SoftwareRebootPending = $false; SoftwareRebootReasons = ''; RebootAdvised = $false; RebootAdvisedReasons = ''; SoftwareLate = @(); PfroPresent = $false; PfroEntries = @(); PfroCount = 0
+        ServicingActive = $false; ServicingReasons = ''; SolidcorePresent = $false; SolidcoreLines = @(); SolidcoreError = ''; TrellixAgentLines = @(); TrellixAgentError = ''; PatchRuns = @(); PatchRunsError = ''; PatchResults = @(); StagedFiles = @()
         HotFixIDs = @(); HotFixLines = @(); HistoryInstalledKBs = @(); HistoryLines = @(); HistoryCount = 0; HistoryError = ''
         LastHotFix = ''; PSVersion = ''
         Reachable = $false; Error = $Reason; Checked = (Get-Date)
@@ -277,12 +404,48 @@ function Wait-PatcherJob {
     # Waits for a job while keeping the GUI alive (DoEvents) and the status bar ticking.
     # "Finished" means Completed / Failed / Stopped / Disconnected - NotStarted, Blocked and
     # Suspending (robust-connection retries after a network blip) are still "in progress".
-    param($Job, [string]$Activity = 'Working', [int]$TimeoutSec = 3600)
+    # -Stoppable (read-only collectors only): the "Stop waiting" button on the status bar gives up on the servers that
+    # have not answered, and a server still silent $StuckAfterSec after every other one has answered is given up on its
+    # own - one wedged WMI call must not hold a 500-server check for hours.  Nothing is ever stopped on an install job.
+    param($Job, [string]$Activity = 'Working', [int]$TimeoutSec = 3600, [switch]$Stoppable, [int]$StuckAfterSec = 0)
     $finished = @('Completed', 'Failed', 'Stopped', 'Disconnected')
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($finished -notcontains $Job.State -and $watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        Set-GuiStatus ('{0} ... {1}s' -f $Activity, [int]$watch.Elapsed.TotalSeconds)
-        Start-Sleep -Milliseconds 300
+    $button = $null; $lent = $null
+    $script:Gui['WaitStopped'] = $false   # this wait's own "Stop waiting" (Invoke-Collector reads it for the reason text)
+    if ($Stoppable -and $script:Gui['StopButton']) {
+        $button = $script:Gui['StopButton']
+        # an install watch (Watch-PatchRuns) may own the button as "Let the servers go": a read-only check running alongside
+        # borrows it and hands it back as it was - neither hidden, nor with this check's stop turned into "let them go" (R6-00)
+        if ($script:Gui['StopOwner']) { $lent = @{ Text = $button.Text; Tip = $button.ToolTipText; Enabled = $button.Enabled; Stop = [bool]$script:Gui['StopRequested'] } }
+        $script:Gui['StopRequested'] = $false; $button.Enabled = $true; $button.Text = 'Stop waiting'; $button.ToolTipText = 'Give up on the servers that have not answered yet (read-only checks only; nothing is changed on them)'; $button.Visible = $true
+    }
+    $stuckSince = $null; $lastOpen = -1
+    try {
+        while ($finished -notcontains $Job.State -and $watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $open = @($Job.ChildJobs | Where-Object { $finished -notcontains $_.State })
+            Set-GuiStatus ('{0} ... {1}s{2}' -f $Activity, [int]$watch.Elapsed.TotalSeconds, $(if ($Stoppable -and $open.Count -gt 0 -and $open.Count -lt @($Job.ChildJobs).Count) { ' - waiting for ' + $open.Count } else { '' }))
+            if ($Stoppable -and $script:Gui['StopRequested']) {
+                $script:Gui['WaitStopped'] = $true
+                Write-PatchLog ("{0}: stopped by {1} - {2} server(s) had not answered: {3}" -f $Activity, (Get-OperatorIdentity), $open.Count, (@($open | ForEach-Object { $_.Location }) -join ', ')) 'WARN'
+                foreach ($c in $open) { Stop-Job -Job $c -ErrorAction SilentlyContinue }
+                break
+            }
+            if ($Stoppable -and $StuckAfterSec -gt 0 -and $open.Count -gt 0 -and $open.Count -lt @($Job.ChildJobs).Count) {
+                # the set of silent servers has not changed for StuckAfterSec: they are wedged, not slow
+                if ($open.Count -ne $lastOpen) { $lastOpen = $open.Count; $stuckSince = $watch.Elapsed.TotalSeconds }
+                elseif ($watch.Elapsed.TotalSeconds - $stuckSince -ge $StuckAfterSec) {
+                    Write-PatchLog ("{0}: {1} server(s) still silent {2} s after every other server answered - giving up on them: {3}" -f $Activity, $open.Count, $StuckAfterSec, (@($open | ForEach-Object { $_.Location }) -join ', ')) 'WARN'
+                    foreach ($c in $open) { Stop-Job -Job $c -ErrorAction SilentlyContinue }
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    } finally {
+        if ($button) {
+            if ($lent) { $button.Text = $lent.Text; $button.ToolTipText = $lent.Tip; $button.Enabled = $lent.Enabled; $script:Gui['StopRequested'] = $lent.Stop }
+            else { $button.Visible = $false }
+        }
     }
     if ($finished -notcontains $Job.State) {
         Write-PatchLog "$Activity timed out after $TimeoutSec s - stopping the job" 'ERROR'
@@ -313,71 +476,195 @@ function Set-GuiProgress {
     [System.Windows.Forms.Application]::DoEvents()
 }
 
-function Get-ServerStatus {
-    # Checks many servers at once (one child job per server) and stores the
-    # result in $script:ServerStatus[name].  Returns the array of status objects.
+function Invoke-Collector {
+    # THE fan-out engine.  Runs one self-contained script block on many servers at once (one child job
+    # per server, up to MaxParallel), stores each server's result under $script:Results[$Name][$server]
+    # with Reachable / Error / Checked added, and returns the array of results.  Every console uses it:
+    # the O/S Patching console through Get-ServerStatus, the Health and Security consoles directly.
     param(
+        [Parameter(Mandatory = $true)][string]$Name,              # collector name, e.g. Status, Inventory, Settings
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,  # runs ON the server; must be self contained
         [Parameter(Mandatory = $true)][string[]]$ComputerName,
-        [switch]$NoRetry       # internal: stops the "prompt for credentials and retry" loop
-    )
+        [object[]]$ArgumentList = @(),
+        [int]$TimeoutSec = 600,
+        [scriptblock]$Summary,        # optional: formats the per-server OK log line, receives the result
+        [scriptblock]$Unreachable,    # optional: builds the "unreachable" object, receives (name, reason)
+        [switch]$NoRetry,             # internal: stops the "prompt for credentials and retry" loop
+        [switch]$NoStop               # a command that may change a server: no "Stop waiting" button and no giving up on a server
+    )                                 # that is slower than the others - only the time limit ends it (and says it may have run)
     $names = @(Get-UniqueNames $ComputerName)
     if ($names.Count -eq 0) { return @() }
+    if (-not $script:Results.ContainsKey($Name)) { $script:Results[$Name] = @{} }
+    $store = $script:Results[$Name]
+    # one malformed name makes Invoke-Command refuse the WHOLE batch: such names are reported on their own
+    $invalid = @($names | Where-Object { -not (Test-LooksLikeHostname $_) })
+    $early = @()
+    foreach ($bad in $invalid) {
+        $why = 'not a valid host name (letters, digits and inner dashes between single dots)'
+        if ($Unreachable) { $r0 = & $Unreachable $bad $why } else { $r0 = [pscustomobject]@{ Computer = $bad; Reachable = $false; Error = $why; Checked = (Get-Date) } }
+        $store[$bad] = $r0; $early += $r0
+        Write-PatchLog "$bad FAILED ($Name): $why" 'ERROR'
+    }
+    $names = @($names | Where-Object { Test-LooksLikeHostname $_ })
+    if ($names.Count -eq 0) { return $early }
 
     $conn = Get-ConnectionArgs
     $who  = 'current login'
     if ($script:Credential) { $who = $script:Credential.UserName }
-    Write-PatchLog ("Invoke-Command -ComputerName {0} -Port {1} -AsJob  (status script, as {2})" -f ($names -join ','), $conn.Port, $who) 'CMD'
+    Write-PatchLog ("Invoke-Command -ComputerName {0} -Port {1} -AsJob  ({2} collector, as {3})" -f ($names -join ','), $conn.Port, $Name, $who) 'CMD'
 
+    # A read-only action running alongside an install keeps its hands off the servers being installed on.
+    if ($script:Gui['NestedBusy'] -and $script:InstallTargets) {
+        $targetLabels = @($script:InstallTargets | ForEach-Object { ([string]$_ -split '\.')[0].ToLower() })
+        $skip = @($names | Where-Object { $targetLabels -contains (($_ -split '\.')[0].ToLower()) })   # SRV01 and srv01.corp.local are one box
+        if ($skip.Count -gt 0) {
+            Write-PatchLog ("{0}: skipping {1} - an install is running there; collect again when it has finished" -f $Name, ($skip -join ', ')) 'WHY'
+            $names = @($names | Where-Object { $skip -notcontains $_ })
+            if ($names.Count -eq 0) { return @() }
+        }
+    }
     $call = @{
         ComputerName  = $names
-        ScriptBlock   = $script:RemoteStatusScript
-        ArgumentList  = $script:Config.TreatPendingFileRenameAsReboot
+        ScriptBlock   = $ScriptBlock
         ThrottleLimit = $script:Config.MaxParallel
         AsJob         = $true
         ErrorAction   = 'SilentlyContinue'
     }
+    if ($ArgumentList.Count -gt 0) { $call['ArgumentList'] = $ArgumentList }
     $job = Invoke-Command @call @conn
-    Wait-PatcherJob -Job $job -Activity ("Checking {0} server(s)" -f $names.Count) -TimeoutSec 600
+    # one limit covers the whole fan-out: with more servers than MaxParallel the later ones wait for a free slot, so
+    # the limit grows with the number of waves (an upper bound, not an expected time)
+    $waves = [math]::Max(1, [math]::Ceiling($names.Count / [double][math]::Max(1, $script:Config.MaxParallel)))
+    $baseTimeout = $TimeoutSec
+    $TimeoutSec = [int]($TimeoutSec * $waves)
+    # a collector only reads: the operator may stop waiting, and a server still silent one base timeout after all the
+    # others answered is given up (it is reported unreachable with that reason)
+    Wait-PatcherJob -Job $job -Activity ("{0}: {1} server(s)" -f $Name, $names.Count) -TimeoutSec $TimeoutSec -Stoppable:(-not $NoStop) -StuckAfterSec $(if ($NoStop) { 0 } else { $baseTimeout })
 
-    $results = @()
+    $results = @($early)
     $denied  = @()
-    foreach ($child in $job.ChildJobs) {
-        $name = $child.Location
-        $jobErrors = @()
-        $out = Receive-Job -Job $child -ErrorAction SilentlyContinue -ErrorVariable jobErrors
-        $status = $null
-        if ($out) {
-            $status = $out | Select-Object -First 1
-            $status | Add-Member -NotePropertyName Reachable -NotePropertyValue $true  -Force
-            $status | Add-Member -NotePropertyName Error     -NotePropertyValue ''     -Force
-            $status | Add-Member -NotePropertyName Checked   -NotePropertyValue (Get-Date) -Force
-            $flag = 'no reboot pending'
-            if ($status.PendingReboot) { $flag = "PENDING REBOOT ($($status.RebootReasons))" }
-            if ($status.ServicingActive) { $flag += ", SERVICING ACTIVE ($($status.ServicingReasons))" }
-            Write-PatchLog ("{0}: build {1}, {2} GB free, up {3} d, {4}, newest hotfixes {5}" -f $name, $status.Build, $status.FreeGB, $status.UptimeDays, $flag, $status.LastHotFix) 'OK'
-        } else {
-            $reason = 'no data returned'
-            if ($jobErrors.Count -gt 0) { $reason = Get-ShortError $jobErrors[0] }
-            elseif ($child.JobStateInfo.Reason) { $reason = Get-ShortError $child.JobStateInfo.Reason }
-            $status = New-UnreachableStatus -ComputerName $name -Reason $reason
-            if ($reason -match 'Access is denied') { $denied += $name }
-            Write-PatchLog "$name FAILED: $reason" 'ERROR'
+    try {   # whatever a summary or unreachable block throws, the job is removed and every child read so far is kept
+        foreach ($child in $job.ChildJobs) {
+            $server = $child.Location
+            $jobErrors = @()
+            $out = Receive-Job -Job $child -ErrorAction SilentlyContinue -ErrorVariable jobErrors
+            $result = $null
+            # Only a real result object counts (every Remote*Script returns one with a Computer property);
+            # a stray string in the output stream must never be mistaken for the result.
+            $objects = @($out | Where-Object { $_ -is [psobject] -and $_.PSObject.Properties['Computer'] })
+            if ($objects.Count -gt 0) {
+                $result = $objects[-1]
+                $result | Add-Member -NotePropertyName Reachable -NotePropertyValue $true  -Force
+                $result | Add-Member -NotePropertyName Error     -NotePropertyValue ''     -Force
+                $result | Add-Member -NotePropertyName Checked   -NotePropertyValue (Get-Date) -Force
+                $sumText = ''
+                if ($Summary) { try { $sumText = [string](& $Summary $result) } catch { $sumText = ('collected (the summary line failed: {0})' -f (Get-ShortError $_)) } } else { $sumText = "$Name collected" }
+                Write-PatchLog ("{0}: {1}" -f $server, $sumText) 'OK'
+            } else {
+                $reason = 'no data returned'
+                if ($jobErrors.Count -gt 0) { $reason = Get-ShortError $jobErrors[0] }
+                elseif ($child.State -eq 'Stopped') { $reason = $(if ($script:Gui['WaitStopped']) { 'given up: the operator stopped waiting' } else { "no answer while every other server had answered (or $TimeoutSec s passed) - given up" }) }
+                elseif ($child.JobStateInfo.Reason) { $reason = Get-ShortError $child.JobStateInfo.Reason }
+                elseif ($out) { $first = ([string]($out | Select-Object -First 1)) -replace '\s+', ' '; $reason = 'unexpected output instead of a result object: ' + $first.Substring(0, [Math]::Min(80, $first.Length)) }
+                if ($Unreachable) { try { $result = & $Unreachable $server $reason } catch { $result = $null } }
+                if (-not $result) { $result = [pscustomobject]@{ Computer = $server; Reachable = $false; Error = $reason; Checked = (Get-Date) } }
+                # out of time, not stopped by the operator: the Commands console tells the operator a command that long needs its own console
+                if ($child.State -eq 'Stopped' -and -not $script:Gui['WaitStopped']) { $result | Add-Member -NotePropertyName TimedOut -NotePropertyValue $true -Force }
+                if ($reason -match 'Access is denied') { $denied += $server }
+                Write-PatchLog "$server FAILED ($Name): $reason" 'ERROR'
+            }
+            $store[$server] = $result
+            $results += $result
         }
-        $script:ServerStatus[$name] = $status
-        $results += $status
-    }
-    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    } finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    Clear-CheckRowCache -Servers @($store.Keys | Where-Object { $names -contains $_ })   # only these servers' rows are stale now
 
-    # Access denied with the current login?  Ask once (foreground) and retry just those servers.
-    if ($denied.Count -gt 0 -and -not $NoRetry -and -not $script:Credential) {
+    # Access denied with the current login?  Ask once (foreground) and retry just those servers - but never
+    # from a read-only action running alongside an install: the install's remaining sessions would silently
+    # switch to the new account.
+    if ($denied.Count -gt 0 -and -not $NoRetry -and -not $script:Credential -and $script:Gui['NestedBusy']) {
+        Write-PatchLog ("{0} server(s) refused the current login; the credential prompt is not offered while '{1}' is running - set credentials first, or retry afterwards" -f $denied.Count, $script:Gui['BusyName']) 'WARN'
+    } elseif ($denied.Count -gt 0 -and -not $NoRetry -and -not $script:Credential) {
         Write-PatchLog ("{0} server(s) refused the current login - offering a credential prompt" -f $denied.Count) 'WHY'
         if (Get-PatcherCredential -Reason "access denied on $($denied -join ', ')") {
-            $retried = Get-ServerStatus -ComputerName $denied -NoRetry
-            foreach ($r in $retried) { $results = @($results | Where-Object { $_.Computer -ne $r.Computer }) + $r }
+            $retried = Invoke-Collector -Name $Name -ScriptBlock $ScriptBlock -ComputerName $denied -ArgumentList $ArgumentList -TimeoutSec $TimeoutSec -Summary $Summary -Unreachable $Unreachable -NoRetry
+            # replace the "denied" placeholders by name as typed (a reachable result carries the server's own NetBIOS name)
+            $results = @($results | Where-Object { $denied -notcontains $_.Computer }) + @($retried)
         }
     }
-    Set-GuiStatus 'Status check finished'
+    Set-GuiStatus "$Name finished"
     return $results
+}
+
+function Get-ServerStatus {
+    # The O/S Patching console's status check = the Status collector.  Results land in $script:ServerStatus
+    # (which IS $script:Results['Status']).  Kept as a named function because everything in the Patching
+    # console calls it and because the log line it writes is the one operators read most.
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ComputerName,
+        [switch]$NoRetry
+    )
+    $summary = {
+        param($s)
+        $flag = 'no reboot pending'
+        if ($s.PendingReboot -or $s.SoftwareRebootPending) { $flag = 'PENDING REBOOT (' + (Get-PendingRebootText -Status $s).Substring(5) + ')' }
+        elseif ($s.RebootAdvised) { $flag = 'reboot advised (removed ' + $s.RebootAdvisedReasons + ')' }
+        if ($s.ServicingActive) { $flag += ", SERVICING ACTIVE ($($s.ServicingReasons))" }
+        if ($s.PSObject.Properties['SolidcorePresent'] -and $s.SolidcorePresent) { $flag += ', Solidcore ' + (Get-SolidcoreText -Status $s) }
+        $ta = Get-TrellixAgentInfo -Status $s
+        if ($ta.Present -and (Test-TrellixInUse)) { $flag += ', Trellix Agent ' + $ta.Text }
+        return ("build {0}, {1} GB free, up {2} d, {3}, newest hotfixes {4}" -f $s.Build, $s.FreeGB, $s.UptimeDays, $flag, $s.LastHotFix)
+    }
+    $unreachable = { param($n, $reason) New-UnreachableStatus -ComputerName $n -Reason $reason }
+    $callStart = Get-Date
+    $out = Invoke-Collector -Name 'Status' -ScriptBlock $script:RemoteStatusScript -ComputerName $ComputerName -ArgumentList @($script:Config.TreatPendingFileRenameAsReboot, $script:Config.RemoteStaging) -Summary $summary -Unreachable $unreachable -NoRetry:$NoRetry
+    # an OS patch run left to itself (06-Install): what the server reported finishes its record, or says it is still going.
+    # Only servers this call really read: a check running alongside an install skips the servers being installed, and
+    # their stored status (from before the launch) knows nothing of the run - it would read as "no record" (R6-01)
+    $fresh = @(@($ComputerName) | Where-Object { $st = $script:ServerStatus[$_]; $st -and $st.Reachable -and $st.Checked -is [datetime] -and $st.Checked -ge $callStart })
+    try { Update-InstallFlagsFromStatus -Servers $fresh } catch { Write-PatchLog "The open install runs could not be matched against the status: $(Get-ShortError $_)" 'WARN' }
+    # a software item the tool stopped waiting for, finished since: its real result goes into the change log on this PC (50-Console-Software)
+    try { Update-SoftwareLateResults -Servers $fresh } catch { Write-PatchLog "Late software results could not be added to the change log: $(Get-ShortError $_)" 'WARN' }
+    # the Trellix Agent services stopped (by the tool before an install, or by hand): ePO hears nothing from such a server
+    # until they run again - the warning in the log at every check; the scan buttons add a pop-up (Show-TrellixAgentWarning)
+    $agentOff = @(Get-TrellixStoppedServers -Servers $fresh)
+    if ($agentOff.Count -gt 0) { Write-PatchLog ("TRELLIX AGENT services stopped or disabled on {0} server(s): {1} - ePO gets no reports from them; when the patching and the reboot are done, tick them and press 'Start Trellix Agent (ticked)'" -f $agentOff.Count, ($agentOff -join ', ')) 'WARN' }
+    return $out
+}
+
+function Get-PendingRebootText {
+    # The "Pending reboot" cell, the same in every console: Windows' own hard flags, then the toolkit's software runs
+    # since the last boot whose installer asked for a reboot (3010 / 1641, the reboot suppressed).  Only the first
+    # blocks OS patches; both make the reboot due.  Then, non-critical, "advised": a removal since the last boot.
+    param($Status)
+    $parts = @()
+    if ($Status.PendingReboot) { $parts += [string]$Status.RebootReasons }
+    if ($Status.SoftwareRebootPending) { $parts += ('software: ' + $Status.SoftwareRebootReasons) }
+    if ($parts.Count -gt 0) { return ('YES: ' + ($parts -join '; ')) }
+    # non-critical: a product was removed since the last boot - the reboot finishes its clean-up
+    if ($Status.RebootAdvised) { return ('advised: removed ' + $Status.RebootAdvisedReasons) }
+    if ($Status.PfroPresent) { return 'no (PFRO only, ignored)' }
+    return 'no'
+}
+
+function Get-CollectorResult {
+    # The last result of one collector for one server, or $null.
+    param([string]$Name, [string]$Server)
+    if (-not $script:Results.ContainsKey($Name)) { return $null }
+    return $script:Results[$Name][$Server]
+}
+
+function ConvertTo-SettingsTable {
+    # Collectors send settings as "Key=Value" text lines (remoting flattens nested objects).  This turns
+    # one or more such line arrays into a case-insensitive hashtable the checks can read.
+    param([string[][]]$LineSets)
+    $t = @{}
+    foreach ($lines in $LineSets) {
+        foreach ($line in @($lines)) {
+            if ($line -match '^([^=]+)=(.*)$') { $t[$Matches[1].Trim()] = $Matches[2] }
+        }
+    }
+    return $t
 }
 
 # =====================================================================
@@ -449,7 +736,7 @@ function Copy-FileToSession {
     param(
         [Parameter(Mandatory = $true)][string]$Path,          # local file
         [Parameter(Mandatory = $true)][string]$Destination,   # full path on the server
-        $Session,                                              # PSSession; $null = local self-test
+        $Session,                                              # PSSession; $null = a local copy, no session
         [int]$SliceKB = 0,                                     # 0 = derive from the server's MaxEnvelopeSizekb
         [string]$LocalHash = ''                                # SHA256 if already known (saves hashing a big file again)
     )
@@ -482,11 +769,8 @@ function Copy-FileToSession {
         if ($SliceKB -gt 4096) { $SliceKB = 4096 }
     }
     $trips = [math]::Ceiling(($local.Length - $offset) / ($SliceKB * 1024))
+    # the tool sizes its slices to whatever the server allows; it never suggests changing the server's WinRM configuration
     Write-PatchLog ("{0} - MaxEnvelopeSizekb on the server is {1}, so {2} MB goes over in {3} KB slices = {4} round trips" -f $label, $info.EnvelopeKB, $totalMB, $SliceKB, $trips) 'WHY'
-    if ($info.EnvelopeKB -le 1024 -and -not $script:EnvelopeTipShown) {
-        Write-PatchLog '   tip: on the servers  winrm set winrm/config @{MaxEnvelopeSizekb="8192"}  makes copies many times faster (shown once per run)' 'WHY'
-        $script:EnvelopeTipShown = $true
-    }
 
     # 3. Send the slices.  If the server still says the request is too big, halve the slice and carry on.
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -531,7 +815,7 @@ function Copy-FileToSession {
         }
     }
     Set-GuiProgress -Marquee
-    if (-not $completed) { throw "$label - the server kept rejecting slices as too big (last size $SliceKB KB). Check MaxEnvelopeSizekb on the server: winrm get winrm/config" }
+    if (-not $completed) { throw "$label - the server kept rejecting even small slices (last size $SliceKB KB); what is copied so far stays and the next attempt resumes from it" }
 
     # 4. Verify: size and SHA256 must match on both sides.  A bad copy is deleted so the next run starts clean.
     Set-GuiStatus "$label - verifying the copy (SHA256)..."

@@ -1,46 +1,39 @@
 ﻿# =====================================================================
-#  07-Gui.ps1  -  THE PATCH PALACE (Windows Forms, built in PowerShell)
-#  The operator's name in the title, banner and quips comes from $Config.OperatorName.
+#  07-Gui.ps1  -  THE SHELL: window, colour-coded tabs, shared log, helpers
 # ---------------------------------------------------------------------
-#  Layout of the main tab:
-#    [ banner: title + random quip ]
-#    [ toolbar: group picker, reload, check status, tick/untick, creds, log ]
-#    [ server grid (left, fills) ............ | patch list + big buttons (right) ]
-#    [ live log (bottom)                                                        ]
+#  Version 2 layout:
+#    [ tabs: O/S Patching | Software | Health | Security | Commands | Code Tour | Settings | About ]  (painted in the console colour)
+#    [ the selected console: banner, toolbar, grids, buttons                  ]
+#    [ shared log (bottom of the window, visible from every console)          ]
 #    [ status bar + patch-o-meter ]
-#  Second tab = "Code Tour": click a topic, read the explanation AND the live
-#  source code of the function that is running right now.
-#
-#  Every button calls Invoke-GuiAction, which disables the buttons, runs the
-#  work, catches errors into the log, then re-enables everything.  Nothing in
-#  this file talks to a server directly - it only calls the functions in
-#  03/04/05/06 so the logic can be tested from the console without a GUI.
+#  This file holds only what every console shares: the window, the tab
+#  painting, the log, Invoke-GuiAction, New-GuiButton, the grid helpers, the
+#  banner/toolbar builders, the details window and the Code Tour tab.
+#  Each console lives in its own file (20-Console-Patching.ps1, 30-Console-
+#  Health.ps1, 40-Console-Security.ps1, 50-Console-Software.ps1, 60-Console-
+#  Settings.ps1, 70-Console-About.ps1, 80-Console-Commands.ps1) and exposes
+#  New-<Name>Console -Tabs.
+#  Nothing in this file talks to a server.
 # =====================================================================
 
 # ---------------------------------------------------------------------
 #  REVIEW RECORD  -  07-Gui.ps1
 # ---------------------------------------------------------------------
-#  Independent review 2026-10-14 (see CODE-REVIEW.md).  Fixed here:
-#  R-02 results list filtered to real result objects; R-12 grid cells now
-#  come from Get-PatchVerdict (same rules as the plan); R-28 window could
-#  be closed and the details dialog opened while an install was running
-#  (FormClosing guard, double-click guard, group box disabled while
-#  busy); R-30 credentials cleared when the GUI closes; R-32 "Open
-#  patches" / notepad paths with spaces; every unused pop-up result is
-#  discarded with $null = (R-01 rule).
+#  Version 1 review (see CODE-REVIEW.md): R-02, R-12, R-28, R-30, R-32, R-01 rule.
+#  Version 2: reduced to the shell; the Patching console moved to 20-Console-Patching.ps1
+#  unchanged in behaviour; grid/banner/toolbar helpers and the generic details window added.
 #  ---------------------------------------------------------------------
 #  HUMAN REVIEW  (fill in by hand and keep it in the file)
-#  Reviewer   : ____CF__________________________   Date : ___14-10-2026___________
-#  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
-#  Checked    : [x] every button   [x] closing during an install is refused
-#               [x] compared with CODE-REVIEW.md
-#  Comments   : modified function New-GuiButton height to better fit button text.
+#  Reviewer   : ________cf______________________   Date : __30-10-2026____________
+#  Verdict    : [x] Approved   [ ] Approved with comments   [ ] Changes required
+#  Checked    : [ ] every button   [ ] closing during an install is refused
+#  Comments   :
 #    -
 # =====================================================================
 
 $script:Quips = @(
     'Snapshots first, heroics later.'
-    "Trellix in maintenance mode? Of course you did, $($script:Config.OperatorName)."
+    'Solidcore in Update Mode? Of course it is, {0}.'
     'Patching: like gardening, but the weeds fight back.'
     'Every reboot is a small holiday for a server.'
     'KBs do not install themselves. Well... they do now.'
@@ -48,132 +41,34 @@ $script:Quips = @(
     'Rule #1: the plan screen is not decorative.'
     '3010 is a happy number. It means "reboot me", not "I failed".'
     'Zero servers pending reboot? Frame it.'
-    'Green is good. Yellow is work. Red is coffee.'
+    'Green is good. Amber is work. Red is coffee.'
     'Port 5985: the little door every server leaves open for you.'
     'Patch Tuesday is a lifestyle.'
+    'A green audit is just a red audit that got attention.'
 )
 
-function Get-RandomQuip { return ($script:Quips | Get-Random) }
+# {0} = the operator's name, filled in when the quip is shown (the Settings tab may have changed it since this file loaded)
+function Get-RandomQuip { return (($script:Quips | Get-Random) -f $script:Config.OperatorName) }
 
-function Get-ShortOsName {
-    # "Microsoft Windows Server 2022 Standard" -> "2022 Std"
-    param([string]$Caption)
-    if (-not $Caption) { return '' }
-    $year = ''
-    if ($Caption -match '(20\d\d)') { $year = $Matches[1] }
-    $edition = ''
-    if ($Caption -match 'Datacenter') { $edition = 'DC' } elseif ($Caption -match 'Standard') { $edition = 'Std' }
-    return ("$year $edition").Trim()
-}
-
-function Get-PatchCellText {
-    # What to show in a KB column for one server.  The decision is Get-PatchVerdict (04-Patches.ps1),
-    # the SAME function the install plan uses, so the grid can never promise what the plan refuses.
-    param($Status, $Patch)
-    return (Get-PatchVerdict -Status $Status -Patch $Patch).Cell
-}
-
-function Get-CheckedServers {
-    $names = @()
-    foreach ($item in $script:Gui['ServerList'].Items) { if ($item.Checked) { $names += $item.Text } }
-    return @(Get-UniqueNames $names)
-}
-
-function Get-CheckedPatches {
-    $list = $script:Gui['PatchList']
-    $picked = @()
-    for ($i = 0; $i -lt $list.Items.Count; $i++) {
-        if ($list.GetItemChecked($i)) { $picked += $script:Patches[$i] }
-    }
-    return $picked
-}
-
-function Update-PatchList {
-    $list = $script:Gui['PatchList']
-    $list.Items.Clear()
-    foreach ($p in $script:Patches) {
-        $line = '{0}  ({1} MB, {2}' -f $p.KB, $p.SizeMB, $p.Type
-        if ($p.TargetBuild -gt 0) { $line += ', ' + $p.TargetOs } elseif ($p.OsLine) { $line += ', ' + $p.OsLine + ' ?' }
-        $line += ')'
-        if ($p.Signature -ne 'Valid') { $line += '  UNSIGNED / ' + $p.Signature }
-        [void]$list.Items.Add($line, $false)
-    }
-    $script:Gui['PatchFolderLabel'].Text = 'Folder: ' + $script:Config.PatchFolder
-}
-
-function Update-ServerList {
-    # Rebuilds the grid from $script:Groups + $script:Patches + $script:ServerStatus.
-    $lv = $script:Gui['ServerList']
-    $wasChecked = @(Get-CheckedServers)
-    $lv.BeginUpdate()
-    $lv.Items.Clear()
-    $lv.Columns.Clear()
-    [void]$lv.Columns.Add('Server', 170)
-    [void]$lv.Columns.Add('Group', 110)
-    [void]$lv.Columns.Add('WinRM', 75)
-    [void]$lv.Columns.Add('OS', 70)
-    [void]$lv.Columns.Add('Build', 95)
-    [void]$lv.Columns.Add('Pending reboot', 150)
-    [void]$lv.Columns.Add('Up (d)', 55)
-    [void]$lv.Columns.Add('Free C: GB', 75)
-    [void]$lv.Columns.Add('Newest hotfixes (same day)', 230)
-    foreach ($p in $script:Patches) { [void]$lv.Columns.Add($p.KB, 105) }
-    [void]$lv.Columns.Add('Checked at', 80)
-
-    $filter = [string]$script:Gui['GroupCombo'].SelectedItem
-    foreach ($g in $script:Groups) {
-        if ($filter -and $filter -ne '(all groups)' -and $filter -ne $g.Name) { continue }
-        foreach ($name in $g.Servers) {
-            $s = $script:ServerStatus[$name]
-            $item = New-Object System.Windows.Forms.ListViewItem($name)
-            [void]$item.SubItems.Add($g.Name)
-            if (-not $s) {
-                foreach ($i in 1..7) { [void]$item.SubItems.Add('') }
-                foreach ($p in $script:Patches) { [void]$item.SubItems.Add('not checked') }
-                [void]$item.SubItems.Add('')
-                $item.BackColor = 'White'
-            } elseif (-not $s.Reachable) {
-                [void]$item.SubItems.Add('FAILED')
-                foreach ($i in 1..6) { [void]$item.SubItems.Add('') }
-                foreach ($p in $script:Patches) { [void]$item.SubItems.Add('?') }
-                [void]$item.SubItems.Add($s.Checked.ToString('HH:mm:ss'))
-                $item.BackColor = 'LightGray'
-                $item.ToolTipText = $s.Error
-            } else {
-                [void]$item.SubItems.Add('OK')
-                [void]$item.SubItems.Add((Get-ShortOsName $s.Caption))
-                [void]$item.SubItems.Add($s.Build)
-                $pend = 'no'
-                if ($s.PendingReboot) { $pend = 'YES: ' + $s.RebootReasons } elseif ($s.PfroPresent) { $pend = 'no (PFRO only, ignored)' }
-                [void]$item.SubItems.Add($pend)
-                [void]$item.SubItems.Add([string]$s.UptimeDays)
-                [void]$item.SubItems.Add([string]$s.FreeGB)
-                [void]$item.SubItems.Add($s.LastHotFix)
-                $anyReady = $false; $allInstalled = ($script:Patches.Count -gt 0)
-                foreach ($p in $script:Patches) {
-                    $cell = Get-PatchCellText -Status $s -Patch $p
-                    [void]$item.SubItems.Add($cell)
-                    if ($cell -eq 'READY') { $anyReady = $true }
-                    if ($cell -notlike 'Installed*') { $allInstalled = $false }
-                }
-                [void]$item.SubItems.Add($s.Checked.ToString('HH:mm:ss'))
-                if ($s.PendingReboot) { $item.BackColor = 'MistyRose' }
-                elseif ($anyReady)    { $item.BackColor = 'LemonChiffon' }
-                elseif ($allInstalled) { $item.BackColor = 'Honeydew' }
-                else { $item.BackColor = 'White' }
-                if ($s.FreeGB -lt $script:Config.WarnFreeGB) { $item.SubItems[7].ForeColor = 'Red'; $item.UseItemStyleForSubItems = $false }
-            }
-            if ($wasChecked -contains $name) { $item.Checked = $true }
-            [void]$lv.Items.Add($item)
-        }
-    }
-    $lv.EndUpdate()
-    $script:Gui['CountLabel'].Text = ('{0} server row(s) shown, {1} ticked' -f $lv.Items.Count, (Get-CheckedServers).Count)
+function New-GuiButton {
+    # -ReadOnly buttons stay enabled while an install runs (they only look, never change anything).
+    param([string]$Text, [int]$X, [int]$Y, [int]$W = 150, [int]$H = 40, [string]$Colour = '', [scriptblock]$OnClick, [string]$Tip = '', [switch]$ReadOnly)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text; $b.Location = New-Object System.Drawing.Point($X, $Y); $b.Size = New-Object System.Drawing.Size($W, $H)
+    # Every button carries a colour of its own (grey when none is asked for): on a white console page a themed button
+    # can draw as bare text and read as a link (operator screenshots 2026-10-23); a coloured one draws its edges everywhere.
+    if (-not $Colour) { $Colour = 'Gainsboro' }
+    $b.BackColor = $Colour; $b.UseVisualStyleBackColor = $false
+    if ($Tip) { $script:Gui['Tips'].SetToolTip($b, $Tip) }
+    if ($ReadOnly) { $b.Tag = 'readonly' }
+    $b.Add_Click($OnClick)
+    $script:Gui['Buttons'] += $b
+    return $b
 }
 
 function Invoke-GuiAction {
     # Wraps every button click: one place for busy-state, error catching and refresh.
-    # -ReadOnly actions (status check, WinRM test) may run WHILE an install is in progress - the
+    # -ReadOnly actions (status checks, WinRM test) may run WHILE an install is in progress - the
     # install's own wait loop pumps the message queue, so a click arrives in the middle of it and the
     # read-only action simply runs nested, without touching the busy flag or the locked buttons.
     param([string]$Name, [scriptblock]$Action, [switch]$ReadOnly)
@@ -188,7 +83,7 @@ function Invoke-GuiAction {
             Write-PatchLog "$Name failed: $(Get-ShortError $_)" 'ERROR'
         } finally {
             $script:Gui['NestedBusy'] = $false
-            Update-ServerList
+            Invoke-ConsoleRefresh
         }
         return
     }
@@ -205,447 +100,887 @@ function Invoke-GuiAction {
     } finally {
         $script:Gui['Progress'].Style = 'Blocks'
         $script:Gui['Progress'].Value = 0
+        try { Invoke-ConsoleRefresh } catch { Write-PatchLog "refresh failed: $(Get-ShortError $_)" 'WARN' }   # before Busy is cleared: no queued click may start inside a half-built grid
         foreach ($b in $script:Gui['Buttons']) { $b.Enabled = $true }
         $script:Gui['Busy'] = $false
         $script:Gui['QuipLabel'].Text = Get-RandomQuip
-        Update-ServerList
         Set-GuiStatus 'Ready.'
     }
 }
 
-function Get-ServerDetailsText {
-    # Everything we know about one server as plain text: status, patch verdicts, both update lists.
-    param([string]$Name)
-    $s = $script:ServerStatus[$Name]
-    $sb = New-Object System.Text.StringBuilder
-    $rule = '-' * 110
-    [void]$sb.AppendLine("SERVER: $Name   (checked $($s.Checked))")
-    [void]$sb.AppendLine($rule)
-    foreach ($p in 'Computer', 'Reachable', 'Error', 'Caption', 'Build', 'LastBoot', 'UptimeDays', 'FreeGB', 'PendingReboot', 'RebootReasons', 'PfroPresent', 'ServicingActive', 'ServicingReasons', 'LastHotFix', 'PSVersion') {
-        [void]$sb.AppendLine(('{0,-14} : {1}' -f $p, $s.$p))
-    }
-    [void]$sb.AppendLine()
-    [void]$sb.AppendLine('  HOW TO READ THIS')
-    [void]$sb.AppendLine('  Build          = the real patch level.  The number after the dot (the UBR) changes with every cumulative')
-    [void]$sb.AppendLine('                   update; the Microsoft update-history page lists it next to each KB, e.g. "KB5122882 (OS Build 20348.5622)".')
-    [void]$sb.AppendLine('                   It only moves AFTER the reboot that finishes the install.')
-    [void]$sb.AppendLine('  LastHotFix     = every Get-HotFix entry from the most recent install date.  The cumulative update and the')
-    [void]$sb.AppendLine('                   .NET cumulative update normally arrive on the same day, so several KBs can share that date.')
-    [void]$sb.AppendLine('  PendingReboot  = true only for the hard signs: CBS RebootPending, CBS PackagesPending, WU RebootRequired.')
-    [void]$sb.AppendLine('  PfroPresent    = PendingFileRenameOperations exists (see below).  Not counted unless you turn it on in 01-Config.ps1.')
-    [void]$sb.AppendLine('  ServicingActive= dism.exe / TiWorker.exe / wusa.exe running right now.  Blocks installs and reboots; TiWorker')
-    [void]$sb.AppendLine('                   also runs for routine maintenance, so re-check in a minute before worrying.')
-
-    [void]$sb.AppendLine()
-    [void]$sb.AppendLine(("PENDING FILE RENAME OPERATIONS  ({0} entries, first {1} shown)" -f $s.PfroCount, @($s.PfroEntries).Count))
-    [void]$sb.AppendLine($rule)
-    [void]$sb.AppendLine('  Files Windows will rename or delete at the next boot because they were locked.  Installers and anti-virus')
-    [void]$sb.AppendLine('  products add to this list constantly and often leave it behind, so on its own it is a weak sign of a')
-    [void]$sb.AppendLine('  needed reboot.  Look at the paths: temp files or AV files = ignore; Windows\WinSxS or servicing files = reboot.')
-    if (@($s.PfroEntries).Count -eq 0) { [void]$sb.AppendLine('  (none)') }
-    foreach ($line in @($s.PfroEntries)) { [void]$sb.AppendLine("  $line") }
-
-    [void]$sb.AppendLine()
-    [void]$sb.AppendLine("PATCHES IN \patches vs THIS SERVER")
-    [void]$sb.AppendLine($rule)
-    if ($script:Patches.Count -eq 0) { [void]$sb.AppendLine('  (no patch files found)') }
-    foreach ($p in $script:Patches) { [void]$sb.AppendLine(('  {0,-10}  {1,-20}  {2}' -f $p.KB, (Get-PatchCellText -Status $s -Patch $p), $p.Name)) }
-
-    [void]$sb.AppendLine()
-    [void]$sb.AppendLine(("INSTALLED HOTFIXES - Get-HotFix / Win32_QuickFixEngineering  ({0} entries)" -f @($s.HotFixIDs).Count))
-    [void]$sb.AppendLine($rule)
-    [void]$sb.AppendLine('  Only CBS packages still present on the box.  Each cumulative update supersedes the previous one,')
-    [void]$sb.AppendLine('  which then drops off this list - so a well patched server shows only a handful here.  This is')
-    [void]$sb.AppendLine('  the primary "is KB x installed?" source because it reflects what is on disk right now.')
-    [void]$sb.AppendLine(('  {0,-10}  {1,-12}  {2,-24}  {3}' -f 'KB', 'Installed', 'Type', 'Installed by'))
-    foreach ($line in @($s.HotFixLines)) { [void]$sb.AppendLine("  $line") }
-
-    [void]$sb.AppendLine()
-    [void]$sb.AppendLine(("WINDOWS UPDATE HISTORY - Windows Update Agent, newest first  (showing {0} of {1})" -f @($s.HistoryLines).Count, $s.HistoryCount))
-    [void]$sb.AppendLine($rule)
-    [void]$sb.AppendLine('  The same list as Settings > Update history: every install attempt, including superseded updates,')
-    [void]$sb.AppendLine('  Defender definitions and failures.  A KB whose newest entry is a successful Install counts as')
-    [void]$sb.AppendLine('  "Installed (history)" in the grid even when Get-HotFix no longer lists it.')
-    if ($s.HistoryError) { [void]$sb.AppendLine("  COULD NOT READ THE HISTORY: $($s.HistoryError)") }
-    [void]$sb.AppendLine(('  {0,-16}  {1,-9}  {2,-18}  {3,-10}  {4}' -f 'Date', 'Operation', 'Result', 'KB', 'Title'))
-    foreach ($line in @($s.HistoryLines)) { [void]$sb.AppendLine("  $line") }
-    return $sb.ToString()
+function Test-GuiDialogAllowed {
+    # A modal dialog opened from a read-only action that runs ALONGSIDE an install would suspend the install's
+    # wait loop (the dialog's own message loop replaces DoEvents until it closes) - so while another action
+    # is running, dialogs wait.  Call it before any ShowDialog / Show-PatcherMessage inside a -ReadOnly action.
+    param([string]$What = 'That dialog')
+    if ($script:Gui['NestedBusy']) { Write-PatchLog "$What is available again when '$($script:Gui['BusyName'])' finishes" 'WARN'; return $false }
+    return $true
 }
 
-function Show-ServerDetails {
-    # Double-click on a row: a scrollable, copyable window with everything we know about that server.
-    param([string]$Name)
-    $s = $script:ServerStatus[$Name]
-    if (-not $s) { $null = Show-PatcherMessage -Text "$Name has not been checked yet. Tick it and press 'Check status'." -Title $Name; return }
+function Show-GuiNotice {
+    # A short warning pop-up - or a log line instead when a read-only action runs alongside another action
+    # (a modal pop-up would suspend that action, see Test-GuiDialogAllowed).
+    param([string]$Text)
+    if ($script:Gui['NestedBusy']) { Write-PatchLog $Text 'WARN'; return }
+    $null = Show-PatcherMessage -Text $Text -Icon 'Warning'
+}
 
+function Register-ConsoleRefresher {
+    # Each console registers how it repaints itself from the shared results.
+    param([string]$Console, [scriptblock]$Refresh)
+    if (-not $script:Gui['RefreshByConsole']) { $script:Gui['RefreshByConsole'] = [ordered]@{}; $script:Gui['Stale'] = @{} }
+    $script:Gui['RefreshByConsole'][$Console] = $Refresh
+}
+
+function Invoke-ConsoleRefresh {
+    # Repaints the console on screen.  The others are only marked stale and repaint when their tab is opened: with
+    # hundreds of servers a repaint of all three consoles after every click costs seconds.  Before the window is shown
+    # (-NoShow) or with -All, every console repaints.  A hand edit of a data, SOE or security file since the
+    # last repaint clears the cached verdicts first.
+    param([switch]$All)
+    if (Test-ToolFilesChanged) { Clear-CheckRowCache }
+    $map = $script:Gui['RefreshByConsole']; if (-not $map) { return }
+    $visible = ''
+    if (-not $All -and $script:Gui['Form'] -and $script:Gui['Form'].Visible -and $script:Gui['Tabs']) { try { $visible = [string]$script:Gui['Tabs'].SelectedTab.Tag } catch { $visible = '' } }
+    foreach ($console in @($map.Keys)) {
+        if ($visible -and $console -ne $visible) { $script:Gui['Stale'][$console] = $true; continue }
+        try { & $map[$console] } catch { Write-PatchLog "refresh of the $console console failed: $(Get-ShortError $_)" 'WARN' }
+        $script:Gui['Stale'][$console] = $false
+    }
+}
+
+function Update-StaleConsole {
+    # The tab just opened: repaint its console if a refresh skipped it while it was hidden.
+    param([string]$Console)
+    if (-not $Console -or -not $script:Gui['Stale'] -or -not $script:Gui['Stale'][$Console]) { return }
+    $r = $script:Gui['RefreshByConsole'][$Console]; if (-not $r) { return }
+    try { & $r } catch { Write-PatchLog "refresh of the $Console console failed: $(Get-ShortError $_)" 'WARN' }
+    $script:Gui['Stale'][$Console] = $false
+}
+
+# ---------------------------------------------------------------------
+#  Grid helpers - every console grid is a ListView built from a column list.
+#  $Columns = @( @{ Name = 'Server'; Width = 170 }, ... ).  The FIRST column is
+#  the row key (ticks survive a rebuild by that key).
+# ---------------------------------------------------------------------
+function New-ConsoleGrid {
+    # Columns: @{ Name; Width; Fill = $true }.  The Fill column takes whatever width is left when the window is
+    # wide, so long text (reasons, roles) is shown instead of empty space.
+    param([object[]]$Columns, [switch]$NoCheckBoxes)
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.View = 'Details'; $lv.CheckBoxes = (-not $NoCheckBoxes); $lv.FullRowSelect = $true; $lv.GridLines = $true
+    $lv.Dock = 'Fill'; $lv.HideSelection = $false; $lv.ShowItemToolTips = $true
+    Set-GridColumns -Grid $lv -Columns $Columns
+    $lv.Add_Resize({ Resize-GridFillColumn -Grid $this })
+    if (-not $NoCheckBoxes) { Set-GridTickOnBoxOnly -Grid $lv }
+    return $lv
+}
+
+function Set-GridTickOnBoxOnly {
+    # A ListView with tick boxes toggles the tick on a double-click anywhere in the row - and a double-click is
+    # also how the details window opens, so a server got ticked by accident.  Only a click on the box itself,
+    # the space bar, or the tool's own code (Set-GridChecks, Set-GridRows) may change a tick.
+    param($Grid)
+    $Grid.Add_MouseDown({
+        if (-not $script:GridMouse) { $script:GridMouse = @{} }
+        $hit = $this.HitTest($_.X, $_.Y)
+        $script:GridMouse[$this.GetHashCode()] = @{ When = [datetime]::Now; OnBox = ($hit.Location -eq 'StateImage') }
+    })
+    $Grid.Add_KeyDown({ if ($script:GridMouse) { $script:GridMouse.Remove($this.GetHashCode()) } })
+    $Grid.Add_ItemCheck({
+        if ($script:GridProgrammatic) { return }
+        $m = $null; if ($script:GridMouse) { $m = $script:GridMouse[$this.GetHashCode()] }
+        if ($m -and -not $m.OnBox -and ([datetime]::Now - $m.When).TotalMilliseconds -lt 800) { $_.NewValue = $_.CurrentValue }
+    })
+}
+
+function Set-GridChecks {
+    # Tick or untick every row from code (the Tick all / Untick buttons) - bypasses the box-only rule above.
+    param($Grid, [bool]$Checked)
+    $script:GridProgrammatic = $true
+    try { foreach ($i in $Grid.Items) { $i.Checked = $Checked } } finally { $script:GridProgrammatic = $false }
+}
+
+function Resize-GridFillColumn {
+    # Gives the column tagged 'fill:<minimum>' the width that is left over (never less than its minimum).
+    param($Grid)
+    if (-not $Grid -or $Grid.Columns.Count -eq 0) { return }
+    $fill = $null; $others = 0
+    foreach ($c in $Grid.Columns) { if ([string]$c.Tag -like 'fill:*') { $fill = $c } else { $others += $c.Width } }
+    if (-not $fill) { return }
+    $min = 120; [void][int]::TryParse(([string]$fill.Tag -split ':')[1], [ref]$min)
+    $avail = $Grid.ClientSize.Width - $others - 4
+    if ($avail -lt $min) { $avail = $min }
+    if ($fill.Width -ne $avail) { $fill.Width = $avail }
+    # ComCtl quirk (field finding 2026-10-19): a grid that was scrolled sideways and then grows until everything fits
+    # ends up with its content shifted RIGHT by the old scroll amount - no scrollbar, last column off the edge.  The
+    # shift only appears after this handler has returned, so a one-shot timer looks again a moment later.
+    if ($Grid.Items.Count -gt 0) { Start-GridOriginCheck -Grid $Grid }
+}
+
+function Start-GridOriginCheck {
+    # One 60 ms timer per grid (kept in $script:GridRepairTimers), restarted on every resize; its tick runs Repair-GridOrigin.
+    param($Grid)
+    if (-not $script:GridRepairTimers) { $script:GridRepairTimers = @{} }
+    $key = $Grid.GetHashCode()
+    $timer = $script:GridRepairTimers[$key]
+    if (-not $timer) {
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 60; $timer.Tag = $Grid
+        $timer.Add_Tick({ $this.Stop(); Repair-GridOrigin -Grid $this.Tag })   # $this = the timer; its Tag = the grid
+        $script:GridRepairTimers[$key] = $timer
+    }
+    $timer.Stop(); $timer.Start()
+}
+
+function Repair-GridOrigin {
+    # Content shifted right (the first item's Bounds.X > 0) is never a legitimate scroll position.  Switching the view
+    # to List and back makes the control recompute its origin; ticks, selection and column widths survive (verified
+    # in the field test).  Returns $true when a repair was made.
+    param($Grid)
+    if (-not $Grid -or $Grid.IsDisposed -or $Grid.Items.Count -eq 0) { return $false }
+    $shift = $Grid.Items[0].Bounds.X
+    if ($shift -le 0) { return $false }
+    $Grid.BeginUpdate()
+    try { $Grid.View = 'List'; $Grid.View = 'Details' } finally { $Grid.EndUpdate() }
+    Write-PatchLog ('grid origin repaired (content was shifted {0} px right after a resize)' -f $shift) 'INFO'
+    return $true
+}
+function Set-GridColumns {
+    param($Grid, [object[]]$Columns)
+    $Grid.Columns.Clear()
+    foreach ($c in $Columns) {
+        $header = $Grid.Columns.Add([string]$c.Name, [int]$c.Width)
+        if ($c.Fill) { $header.Tag = 'fill:' + [int]$c.Width }
+    }
+}
+
+function Set-GridRows {
+    # $Rows are objects; cell text = property named like the column.  $RowColour { param($row) -> colour name }.
+    # $ToolTipProperty names a property shown when hovering the row.  Ticks are kept by first-column text.
+    # $CellColourProperty names a hashtable on the row (column name -> colour name) for cells coloured apart from
+    # their row (the Software grid: an installed package green in a row that is yellow for another).
+    # Built for thousands of rows: cells are read straight off the object (a missing property reads as empty) and
+    # added in one AddRange per row.
+    param($Grid, [object[]]$Rows, [scriptblock]$RowColour, [string]$ToolTipProperty = '', [switch]$NoKeepChecks, [string]$CellColourProperty = '')
+    $wasChecked = @{}
+    if (-not $NoKeepChecks) { foreach ($k in @(Get-GridChecked -Grid $Grid)) { $wasChecked[$k] = $true } }
+    $names = @($Grid.Columns | ForEach-Object { $_.Text })
+    $script:GridProgrammatic = $true    # restoring ticks is the tool's doing, not a click (see Set-GridTickOnBoxOnly)
+    $Grid.BeginUpdate()
+    try {
+    $Grid.Items.Clear()
+    $items = New-Object System.Collections.Generic.List[System.Windows.Forms.ListViewItem]
+    foreach ($row in @($Rows)) {
+        $first = [string]$row.($names[0])
+        $item = New-Object System.Windows.Forms.ListViewItem($first)
+        if ($names.Count -gt 1) {
+            $subs = New-Object string[] ($names.Count - 1)
+            for ($i = 1; $i -lt $names.Count; $i++) { $v = $row.($names[$i]); if ($v -is [array]) { $v = ($v -join ', ') }; $subs[$i - 1] = [string]$v }
+            $item.SubItems.AddRange($subs)
+        }
+        if ($RowColour) { $col = & $RowColour $row; if ($col) { $item.BackColor = $col } }
+        if ($CellColourProperty) {
+            $cells = $row.$CellColourProperty
+            if ($cells -and $cells.Count -gt 0) {
+                # each cell then carries its own colour: the row's, unless the table names another
+                $item.UseItemStyleForSubItems = $false
+                $base = $item.BackColor
+                for ($i = 0; $i -lt $names.Count; $i++) {
+                    $cc = $cells[$names[$i]]
+                    if ($cc) { $item.SubItems[$i].BackColor = [System.Drawing.Color]::FromName([string]$cc) } else { $item.SubItems[$i].BackColor = $base }
+                }
+            }
+        }
+        if ($ToolTipProperty) { $item.ToolTipText = [string]$row.$ToolTipProperty }
+        $item.Tag = $row
+        if ($wasChecked.Count -gt 0 -and $wasChecked.ContainsKey($first)) { $item.Checked = $true }
+        $items.Add($item)
+    }
+    $Grid.Items.AddRange($items.ToArray())
+    } finally { $Grid.EndUpdate(); $script:GridProgrammatic = $false }   # never leave a grid frozen or the tick guard off
+    Resize-GridFillColumn -Grid $Grid
+}
+
+function Get-GridChecked {
+    param($Grid)
+    $names = @()
+    foreach ($item in $Grid.Items) { if ($item.Checked) { $names += $item.Text } }
+    return @(Get-UniqueNames $names)
+}
+
+function Get-GridAllKeys {
+    param($Grid)
+    return @(Get-UniqueNames @($Grid.Items | ForEach-Object { $_.Text }))
+}
+
+function Get-GridSelectedRow {
+    param($Grid)
+    if ($Grid.SelectedItems.Count -gt 0) { return $Grid.SelectedItems[0].Tag }
+    return $null
+}
+
+# ---------------------------------------------------------------------
+#  Banner, toolbar, group picker - the same look on every console tab.
+# ---------------------------------------------------------------------
+function New-ConsoleBanner {
+    param($Tab, [string]$Console, [string]$Title, [string]$Subtitle = '')
+    $back = $script:Config.ConsoleColours[$Console]; if (-not $back) { $back = 'MidnightBlue' }
+    $fore = $script:Config.ConsoleText[$Console]; if (-not $fore) { $fore = 'White' }
+    $banner = New-Object System.Windows.Forms.Panel
+    $banner.Dock = 'Top'; $banner.Height = 64; $banner.BackColor = $back
+    $t = New-Object System.Windows.Forms.Label
+    $t.Text = $Title; $t.ForeColor = $fore; $t.AutoSize = $true
+    $t.Font = New-Object System.Drawing.Font('Segoe UI', 20, [System.Drawing.FontStyle]::Bold)
+    $t.Location = New-Object System.Drawing.Point(12, 6)
+    $banner.Controls.Add($t)
+    $s = New-Object System.Windows.Forms.Label
+    $s.Text = $Subtitle; $s.ForeColor = 'White'; $s.AutoSize = $true
+    $s.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic)
+    $s.Location = New-Object System.Drawing.Point(520, 24)
+    $banner.Controls.Add($s)
+    $Tab.Controls.Add($banner)
+    return [pscustomobject]@{ Panel = $banner; Title = $t; Subtitle = $s }
+}
+
+function New-GridHeader {
+    # A heading strip above a grid: bold heading on the left, live detail text (counts) in grey after it, a rule
+    # underneath.  Dock Top - add it to the grid's parent AFTER the grid and BringToFront the grid (dock order).
+    param([string]$Heading, [string]$Detail = '', [string]$Tip = '')
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Dock = 'Top'; $panel.Height = 26; $panel.BackColor = 'WhiteSmoke'
+    $rule = New-Object System.Windows.Forms.Panel; $rule.Dock = 'Bottom'; $rule.Height = 1; $rule.BackColor = 'Silver'
+    $headLabel = New-Object System.Windows.Forms.Label
+    $headLabel.Text = $Heading; $headLabel.AutoSize = $true; $headLabel.Location = New-Object System.Drawing.Point(6, 5)
+    $headLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold); $headLabel.ForeColor = 'Black'
+    $detailLabel = New-Object System.Windows.Forms.Label
+    $detailLabel.Text = $Detail; $detailLabel.AutoSize = $true; $detailLabel.ForeColor = 'DimGray'; $detailLabel.Location = New-Object System.Drawing.Point(($headLabel.PreferredWidth + 18), 7)
+    $panel.Controls.AddRange(@($rule, $headLabel, $detailLabel))
+    if ($Tip) { $script:Gui['Tips'].SetToolTip($headLabel, $Tip); $script:Gui['Tips'].SetToolTip($detailLabel, $Tip) }
+    return @{ Panel = $panel; Title = $headLabel; Info = $detailLabel }
+}
+
+# ---------------------------------------------------------------------
+#  Lists that must survive a big fleet (hundreds of servers)
+#    New-TickList      a filter box over a CheckedListBox; ticks live in a hashtable so filtering never loses them
+#    Set-ComboTypeAhead / Get-ComboChoice   a combo you can type into, with suggestions, instead of a 500-row drop-down
+# ---------------------------------------------------------------------
+function New-TickList {
+    # Returns the state hashtable: Panel (Dock Left, or re-dock it yourself), List, Filter, TitleLabel, Names, Ticks.
+    # Every handler finds that state through its control's Tag; -OnChange runs after any tick change.
+    param([string]$Title, [scriptblock]$OnChange, [int]$Width = 260)
+    $state = @{ Names = @(); Ticks = @{}; OnChange = $OnChange; TitleText = $Title; Filling = $false }
+    $panel = New-Object System.Windows.Forms.Panel; $panel.Dock = 'Left'; $panel.Width = $Width
+    $titleLabel = New-Object System.Windows.Forms.Label; $titleLabel.Dock = 'Top'; $titleLabel.Height = 24; $titleLabel.Text = $Title; $titleLabel.Padding = New-Object System.Windows.Forms.Padding(4, 6, 0, 0)
+    $filterBar = New-Object System.Windows.Forms.Panel; $filterBar.Dock = 'Top'; $filterBar.Height = 28
+    $filter = New-Object System.Windows.Forms.TextBox; $filter.Location = New-Object System.Drawing.Point(4, 4); $filter.Width = $Width - 8; $filter.Tag = $state
+    $script:Gui['Tips'].SetToolTip($filter, 'Type part of a name to shorten the list; ticks are kept while you filter.')
+    $filter.Add_TextChanged({ Update-TickListItems -State $this.Tag })
+    $filterBar.Controls.Add($filter)
+    $list = New-Object System.Windows.Forms.CheckedListBox; $list.Dock = 'Fill'; $list.CheckOnClick = $true; $list.IntegralHeight = $false; $list.Tag = $state
+    $list.Add_ItemCheck({
+        # fires BEFORE the tick changes: record the new state, then tell the owner
+        $st = $this.Tag; if ($st.Filling) { return }
+        $st.Ticks[[string]$this.Items[$_.Index]] = ($_.NewValue -eq 'Checked')
+        Update-TickListTitle -State $st
+        if ($st.OnChange) { & $st.OnChange }
+    })
+    $btns = New-Object System.Windows.Forms.Panel; $btns.Dock = 'Bottom'; $btns.Height = 38
+    $all = New-Object System.Windows.Forms.Button; $all.Text = 'Tick shown'; $all.Location = New-Object System.Drawing.Point(4, 5); $all.Size = New-Object System.Drawing.Size(100, 28); $all.Tag = $state
+    $all.Add_Click({ Set-TickListShown -State $this.Tag -Checked $true })
+    $none = New-Object System.Windows.Forms.Button; $none.Text = 'Untick shown'; $none.Location = New-Object System.Drawing.Point(110, 5); $none.Size = New-Object System.Drawing.Size(100, 28); $none.Tag = $state
+    $none.Add_Click({ Set-TickListShown -State $this.Tag -Checked $false })
+    $btns.Controls.AddRange(@($all, $none))
+    $panel.Controls.AddRange(@($list, $filterBar, $titleLabel, $btns)); $list.BringToFront()
+    $state.Panel = $panel; $state.List = $list; $state.Filter = $filter; $state.TitleLabel = $titleLabel
+    return $state
+}
+
+function Set-TickListNames {
+    # The names to offer: names already known keep their tick, new ones get -DefaultTicked, vanished ones are dropped.
+    param($State, [string[]]$Names, [bool]$DefaultTicked = $false)
+    $ticks = @{}
+    foreach ($n in @($Names)) { if ($State.Ticks.ContainsKey($n)) { $ticks[$n] = $State.Ticks[$n] } else { $ticks[$n] = $DefaultTicked } }
+    $State.Names = @($Names); $State.Ticks = $ticks
+    Update-TickListItems -State $State
+}
+
+function Update-TickListItems {
+    # Rebuilds the visible list from the names that match the filter, ticking from the hashtable.
+    param($State)
+    $q = [string]$State.Filter.Text
+    $State.Filling = $true
+    try {
+        $State.List.BeginUpdate(); $State.List.Items.Clear()
+        foreach ($n in @($State.Names)) {
+            if ($q -and $n.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }   # plain text, not a wildcard pattern
+            $idx = $State.List.Items.Add($n)
+            if ($State.Ticks[$n]) { $State.List.SetItemChecked($idx, $true) }
+        }
+    } finally { $State.List.EndUpdate(); $State.Filling = $false }
+    Update-TickListTitle -State $State
+}
+
+function Update-TickListTitle {
+    param($State)
+    $q = [string]$State.Filter.Text
+    $ticked = @($State.Ticks.Keys | Where-Object { $State.Ticks[$_] }).Count
+    $State.TitleLabel.Text = ('{0}  ({1} of {2} ticked{3})' -f $State.TitleText, $ticked, @($State.Names).Count, $(if ($q) { ', ' + $State.List.Items.Count + ' shown' } else { '' }))
+}
+
+function Set-TickListShown {
+    # Tick shown / Untick shown: only the names the filter currently shows.
+    param($State, [bool]$Checked)
+    foreach ($n in @($State.List.Items | ForEach-Object { [string]$_ })) { $State.Ticks[$n] = $Checked }
+    Update-TickListItems -State $State
+    if ($State.OnChange) { & $State.OnChange }
+}
+
+function Get-TickListChecked {
+    param($State)
+    return @(@($State.Names) | Where-Object { $State.Ticks[$_] })
+}
+
+function Set-ComboTypeAhead {
+    # A long list becomes typeable: the box accepts text and suggests the matching items as you type.
+    param($Combo)
+    $Combo.DropDownStyle = 'DropDown'; $Combo.AutoCompleteMode = 'SuggestAppend'; $Combo.AutoCompleteSource = 'ListItems'; $Combo.DropDownHeight = 320
+}
+
+function Get-ComboChoice {
+    # The item a type-ahead combo names right now: its text when that matches an item (any case), else ''.
+    param($Combo)
+    $t = ([string]$Combo.Text).Trim()
+    if (-not $t) { return '' }
+    foreach ($i in $Combo.Items) { if ([string]$i -ieq $t) { return [string]$i } }
+    return ''
+}
+
+function New-ConsoleToolbar {
+    param($Tab, [int]$Height = 56)
+    $toolbar = New-Object System.Windows.Forms.Panel
+    $toolbar.Dock = 'Top'; $toolbar.Height = $Height
+    $Tab.Controls.Add($toolbar)
+    return $toolbar
+}
+
+function New-GroupPicker {
+    # "Group: [combo]" on a toolbar; the combo is filled by Initialize-ToolkitData for every console.
+    param($Toolbar, [int]$X = 8, [scriptblock]$OnChange)
+    $lbl = New-Object System.Windows.Forms.Label; $lbl.Text = 'Group:'; $lbl.Location = New-Object System.Drawing.Point($X, 13); $lbl.AutoSize = $true
+    $Toolbar.Controls.Add($lbl)
+    $combo = New-Object System.Windows.Forms.ComboBox
+    $combo.Location = New-Object System.Drawing.Point(($X + 47), 9); $combo.Width = 170; $combo.DropDownStyle = 'DropDownList'
+    if ($OnChange) { $combo.Add_SelectedIndexChanged($OnChange) }
+    $Toolbar.Controls.Add($combo)
+    $script:Gui['GroupCombos'] += $combo
+    return $combo
+}
+
+function Get-GroupRows {
+    # (Server, Group) pairs for the group a combo has selected.
+    param($Combo)
+    $filter = [string]$Combo.SelectedItem
+    $rows = @()
+    foreach ($g in $script:Groups) {
+        if ($filter -and $filter -ne '(all groups)' -and $filter -ne $g.Name) { continue }
+        foreach ($name in $g.Servers) { $rows += [pscustomobject]@{ Server = $name; Group = $g.Name } }
+    }
+    return $rows
+}
+
+function New-DialogButtonBar {
+    # A bottom bar with right-aligned buttons that stay right-aligned when the dialog is resized.
+    # A control anchored Right keeps the distance to its parent's edge AS IT WAS when the anchor was set, so the
+    # bar must already have the dialog's width before the buttons are placed - a Panel is 200 px wide until it
+    # is docked, and a button placed at X 880 in it ends up far outside the dialog (field finding, 2026-10-19).
+    # $Buttons: @{ Text; Result ('OK', 'Cancel', 'Yes', 'No' - optional); Width (optional) }, left to right.
+    # Returns @{ Panel; Buttons } with the Button objects in the same order.
+    param($Dialog, [object[]]$Buttons, [int]$Height = 44, [string]$Hint = '')
+    $bar = New-Object System.Windows.Forms.Panel
+    $bar.Dock = 'Bottom'; $bar.Height = $Height; $bar.Width = $Dialog.ClientSize.Width
+    if ($Hint) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $Hint; $lbl.Location = New-Object System.Drawing.Point(10, 13); $lbl.AutoSize = $true; $lbl.ForeColor = 'DimGray'
+        $bar.Controls.Add($lbl)
+    }
+    $x = $Dialog.ClientSize.Width - 10
+    $made = @()
+    for ($i = $Buttons.Count - 1; $i -ge 0; $i--) {
+        $spec = $Buttons[$i]
+        $w = 100; if ($spec.Width) { $w = [int]$spec.Width }
+        $x -= $w
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = [string]$spec.Text; $b.Size = New-Object System.Drawing.Size($w, 30); $b.Location = New-Object System.Drawing.Point($x, 7); $b.Anchor = 'Top,Right'
+        if ($spec.Result) { $b.DialogResult = [string]$spec.Result }
+        $bar.Controls.Add($b)
+        $made = @($b) + $made
+        $x -= 10
+    }
+    $Dialog.Controls.Add($bar)
+    return @{ Panel = $bar; Buttons = $made }
+}
+
+function Save-HtmlAs {
+    # A standard Save dialog for an HTML page: any folder, with the reports folder and a stamped file name offered.
+    # Returns the path written, or '' when the user cancelled.  Used by the details window and the Code Tour.
+    param([string]$Html, [string]$BaseName, $Owner, [string]$What = 'page')
+    if (-not (Test-Path -LiteralPath $script:Config.ReportFolder)) { New-Item -ItemType Directory -Path $script:Config.ReportFolder -Force | Out-Null }
+    $save = New-Object System.Windows.Forms.SaveFileDialog
+    try {
+        $save.Title = "Save this $What as HTML"; $save.Filter = 'HTML page (*.html)|*.html|All files (*.*)|*.*'; $save.DefaultExt = 'html'; $save.AddExtension = $true; $save.OverwritePrompt = $true
+        $save.InitialDirectory = $script:Config.ReportFolder
+        $save.FileName = (($BaseName -replace '[^A-Za-z0-9]+', '-').Trim('-')) + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.html'
+        if ($save.ShowDialog($Owner) -ne 'OK') { return '' }
+        [System.IO.File]::WriteAllText($save.FileName, $Html, (New-Object System.Text.UTF8Encoding($true)))
+        Write-PatchLog "Saved: $($save.FileName)" 'OK'
+        return $save.FileName
+    } finally { $save.Dispose() }
+}
+
+function Show-DetailsWindow {
+    # The window behind every console's double-click.  -Html shows a formatted page (headings, tables, coloured
+    # lights, wrapped text) in the built-in browser control, offline; -Text shows plain text in a box.
+    param([string]$Title, [string]$Text = '', [string]$Html = '')
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = "Details: $Name"
-    $dlg.Size = New-Object System.Drawing.Size(1100, 720)
+    $dlg.Text = $Title
+    # 1200 x 780, or what the screen has: on a 1366 x 768 laptop the full size would put the button bar below the edge
+    $w = 1200; $h = 780
+    try { $owner = $script:Gui['Form']; if ($owner -and -not $owner.IsDisposed) { $wa = [System.Windows.Forms.Screen]::FromControl($owner).WorkingArea; $w = [math]::Min($w, $wa.Width - 40); $h = [math]::Min($h, $wa.Height - 40) } } catch { }
+    $dlg.Size = New-Object System.Drawing.Size($w, $h)
     $dlg.StartPosition = 'CenterParent'
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-
-    $box = New-Object System.Windows.Forms.TextBox
-    $box.Multiline = $true; $box.ReadOnly = $true; $box.ScrollBars = 'Both'; $box.WordWrap = $false
-    $box.Font = New-Object System.Drawing.Font('Consolas', 9); $box.BackColor = 'White'; $box.Dock = 'Fill'
-    $box.Text = Get-ServerDetailsText -Name $Name
-    $box.Select(0, 0)
-
-    $bottom = New-Object System.Windows.Forms.Panel
-    $bottom.Dock = 'Bottom'; $bottom.Height = 40
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = 'Ctrl+A then Ctrl+C copies everything.'; $hint.Location = New-Object System.Drawing.Point(10, 12); $hint.AutoSize = $true; $hint.ForeColor = 'DimGray'
-    $close = New-Object System.Windows.Forms.Button
-    $close.Text = 'Close'; $close.Size = New-Object System.Drawing.Size(90, 28); $close.Location = New-Object System.Drawing.Point(980, 6); $close.Anchor = 'Top,Right'
-    $close.Add_Click({ $dlg.Close() })
-    $bottom.Controls.Add($hint); $bottom.Controls.Add($close)
-
-    $dlg.Controls.Add($box); $dlg.Controls.Add($bottom)
-    $box.BringToFront()
-    $dlg.CancelButton = $close
+    if ($Html) {
+        $view = New-Object System.Windows.Forms.WebBrowser
+        $view.Dock = 'Fill'; $view.ScriptErrorsSuppressed = $true; $view.AllowNavigation = $false; $view.AllowWebBrowserDrop = $false; $view.IsWebBrowserContextMenuEnabled = $true
+        $view.DocumentText = $Html
+        $script:Gui['DetailsHtml'] = $Html
+        $bar = New-DialogButtonBar -Dialog $dlg -Buttons @(@{ Text = 'Save as HTML...'; Width = 130 }, @{ Text = 'Close'; Result = 'Cancel'; Width = 90 }) -Height 40 -Hint 'Ctrl+A then Ctrl+C copies the page; Save as HTML... asks where to save it (the reports folder is offered first).'
+        $script:Gui['DetailsHint'] = $bar.Panel.Controls[0]
+        $bar.Buttons[0].Add_Click({
+            try {
+                $path = Save-HtmlAs -Html $script:Gui['DetailsHtml'] -BaseName ('Details-' + $script:Gui['DetailsTitle']) -Owner $this.FindForm()
+                if ($path) { $script:Gui['DetailsHint'].Text = 'Saved: ' + $path } else { $script:Gui['DetailsHint'].Text = 'Not saved.' }
+            } catch { $script:Gui['DetailsHint'].Text = 'Not saved: ' + (Get-ShortError $_); Write-PatchLog "Save failed: $(Get-ShortError $_)" 'ERROR' }
+        })
+        $script:Gui['DetailsTitle'] = $Title
+        $dlg.Controls.Add($view)
+        $view.BringToFront()
+        $dlg.CancelButton = $bar.Buttons[1]
+    } else {
+        $box = New-Object System.Windows.Forms.TextBox
+        $box.Multiline = $true; $box.ReadOnly = $true; $box.ScrollBars = 'Both'; $box.WordWrap = $false
+        $box.Font = New-Object System.Drawing.Font('Consolas', 9); $box.BackColor = 'White'; $box.Dock = 'Fill'
+        $box.Text = $Text
+        $box.Select(0, 0)
+        $bar = New-DialogButtonBar -Dialog $dlg -Buttons @(@{ Text = 'Close'; Result = 'Cancel'; Width = 90 }) -Height 40 -Hint 'Ctrl+A then Ctrl+C copies everything.'
+        $dlg.Controls.Add($box)
+        $box.BringToFront()
+        $dlg.CancelButton = $bar.Buttons[0]
+    }
     [void]$dlg.ShowDialog($script:Gui['Form'])
     $dlg.Dispose()
 }
 
-function New-GuiButton {
-    # -ReadOnly buttons stay enabled while an install runs (they only look, never change anything).
-    param([string]$Text, [int]$X, [int]$Y, [int]$W = 150, [int]$H = 40, [string]$Colour = '', [scriptblock]$OnClick, [string]$Tip = '', [switch]$ReadOnly)
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $Text; $b.Location = New-Object System.Drawing.Point($X, $Y); $b.Size = New-Object System.Drawing.Size($W, $H)
-    $b.UseVisualStyleBackColor = $true
-    if ($Colour) { $b.BackColor = $Colour; $b.UseVisualStyleBackColor = $false }
-    if ($Tip) { $script:Gui['Tips'].SetToolTip($b, $Tip) }
-    if ($ReadOnly) { $b.Tag = 'readonly' }
-    $b.Add_Click($OnClick)
-    $script:Gui['Buttons'] += $b
-    return $b
+function Get-ConsoleName {
+    # The name a console is shown by (ConsoleNames in 01-Config.ps1: Patching -> 'O/S Patching'); the key stays the
+    # same inside the tool (colours, report file names, refreshers).
+    param([string]$Console)
+    $n = [string]$script:Config.ConsoleNames[$Console]
+    if ($n) { return $n }
+    return $Console
 }
 
-function Show-PatcherGui {
-    param([switch]$NoShow)   # -NoShow builds the form without displaying it (used for self-tests)
+function Register-PanelButtonRows {
+    # A right-hand panel's rows of two or three buttons keep up with the panel's width (the divider dragged, a wide
+    # window): the full-width buttons are anchored to the right edge already; these rows are re-laid on every resize,
+    # each button keeping its share of the width, so every right edge is the same (owner's screenshot 2026-10-28).
+    # A row = the buttons that share a Top and are narrower than the full width.
+    # The full-width controls (list, folder line, PATCH IT!, Help ...) and the ones pinned to the right edge are placed
+    # here too, not by Anchor: in a scrolling panel narrower than its design width WinForms' anchoring stops 5 px short
+    # and leaves a horizontal scroll bar (measured 2026-10-29), so every edge is set from the client width instead.
+    param($Panel, [string]$Name)
+    $rows = @()
+    foreach ($g in @($Panel.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Width -lt 390 } | Group-Object Top)) {
+        if ($g.Count -lt 2) { continue }
+        $buttons = @($g.Group | Sort-Object Left)
+        $rows += , @{ Buttons = $buttons; Widths = @($buttons | ForEach-Object { $_.Width }) }
+    }
+    $full = @($Panel.Controls | Where-Object { $_.Width -ge 390 })
+    $pinned = @($Panel.Controls | Where-Object { $_.Width -lt 390 -and ($_.Anchor -band [System.Windows.Forms.AnchorStyles]::Right) -and -not ($_.Anchor -band [System.Windows.Forms.AnchorStyles]::Left) })
+    foreach ($c in $full + $pinned) { $c.Anchor = 'Top, Left' }
+    if (-not $script:Gui['PanelRows']) { $script:Gui['PanelRows'] = @{} }
+    $script:Gui['PanelRows'][$Name] = $rows
+    $script:Gui['PanelRows'][$Name + '|full'] = $full
+    $script:Gui['PanelRows'][$Name + '|pinned'] = $pinned
+    $Panel.Name = $Name
+    $Panel.Add_ClientSizeChanged({ Resize-PanelButtonRows -Panel $this })   # also when a scroll bar comes or goes
+    Resize-PanelButtonRows -Panel $Panel
+}
+
+function Resize-PanelButtonRows {
+    param($Panel)
+    if (-not $script:Gui['PanelRows'] -or -not $Panel.Name -or -not $script:Gui['PanelRows'].ContainsKey($Panel.Name)) { return }
+    if ($script:Gui['PanelResizing']) { return }   # the layout pass below changes the client size once more: no second round
+    $script:Gui['PanelResizing'] = $true
+    try { Set-PanelButtonLayout -Panel $Panel; $Panel.PerformLayout() } finally { $script:Gui['PanelResizing'] = $false }   # the pass drops a sideways scroll bar computed before the controls moved
+}
+
+function Set-PanelButtonLayout {
+    param($Panel)
+    $rows = @($script:Gui['PanelRows'][$Panel.Name])
+    $avail = $Panel.ClientSize.Width - 25   # 10 px on the left, 15 on the right: where the full-width buttons sit at the design width
+    if ($avail -lt 120) { return }
+    $sx = $Panel.AutoScrollPosition.X   # a panel scrolled sideways: positions are relative to the visible area
+    foreach ($c in @($script:Gui['PanelRows'][$Panel.Name + '|full'])) { $c.Left = 10 + $sx; $c.Width = $avail }
+    foreach ($c in @($script:Gui['PanelRows'][$Panel.Name + '|pinned'])) { $c.Left = 10 + $sx + $avail - $c.Width }
+    foreach ($row in $rows) {
+        $buttons = @($row.Buttons); $widths = @($row.Widths)
+        $n = $buttons.Count; $gap = 5
+        $total = ($widths | Measure-Object -Sum).Sum
+        $x = 10; $left = $avail - $gap * ($n - 1)
+        for ($i = 0; $i -lt $n; $i++) {
+            $w = [int][math]::Floor($left * $widths[$i] / $total)
+            if ($i -eq $n - 1) { $w = $avail - ($x - 10) }   # the last one takes the rounding, so the right edge is exact
+            $buttons[$i].Left = $x + $sx; $buttons[$i].Width = $w
+            $x += $w + $gap
+        }
+    }
+}
+
+function Add-PanelBand {
+    # A band of a right-hand panel that a setting can take away (the Trellix boxes and buttons): its controls, and the
+    # height they take - when hidden, everything below moves up by it, so no hole is left (Set-PanelBandShown).
+    param($Panel, [object[]]$Controls, [int]$Height, [string]$Kind)
+    if (-not $script:Gui['PanelBands']) { $script:Gui['PanelBands'] = @() }
+    $designTop = (@($Controls) | Measure-Object -Property Top -Minimum).Minimum
+    $script:Gui['PanelBands'] += , @{ Panel = $Panel; Controls = @($Controls); Height = $Height; Kind = $Kind; Shown = $true; DesignTop = $designTop }
+}
+
+function Get-PanelBandOffset {
+    # How much higher a control designed at $DesignTop sits while bands above it are hidden - for a panel that re-places its
+    # own controls from their design positions (the Software panel, under its "* NEW" box).
+    param($Panel, [int]$DesignTop)
+    $off = 0
+    foreach ($band in @($script:Gui['PanelBands'])) { if ([object]::ReferenceEquals($band.Panel, $Panel) -and -not $band.Shown -and $band.DesignTop -lt $DesignTop) { $off -= $band.Height } }
+    return $off
+}
+
+function Set-PanelBandShown {
+    # Every band of $Kind shown or hidden; a change moves the controls below the band by its height.  Called after the
+    # panels' button rows are registered (Register-PanelButtonRows groups by Top: moved first, a hidden row and the row
+    # below would become one).
+    param([string]$Kind, [bool]$Shown)
+    foreach ($band in @($script:Gui['PanelBands'])) {
+        if ($band.Kind -ne $Kind -or [bool]$band.Shown -eq $Shown) { continue }
+        $top = (@($band.Controls) | Measure-Object -Property Top -Minimum).Minimum
+        $by = $band.Height; if (-not $Shown) { $by = -$band.Height }
+        # at or below the band's top: hidden, the next row sits exactly there, and showing it again must move that row too
+        foreach ($c in @($band.Panel.Controls)) { if (@($band.Controls) -notcontains $c -and $c.Top -ge $top) { $c.Top += $by } }
+        foreach ($c in @($band.Controls)) { $c.Visible = $Shown }
+        $band.Shown = $Shown
+    }
+}
+
+function Update-TrellixShown {
+    # TrellixInUse (Settings tab), applied at once: the Trellix bands of both right-hand panels (the "Stop the Trellix Agent
+    # services first" box, the Start / Stop Trellix Agent buttons).  The Trellix columns follow the setting whenever a
+    # grid is built (a save marks every console for a redraw).
+    Set-PanelBandShown -Kind 'Trellix' -Shown (Test-TrellixInUse)
+}
+
+function Get-ToolkitStartSize {
+    # The window's first size.  Tall enough that the right-hand panels (O/S Patching, Software) show every button
+    # without scrolling - measured from the controls themselves, so a new button is allowed for - and as
+    # wide as the screen allows, up to 1600 px.  The log underneath gets 220 px, and gives way down to 120 px on a short
+    # screen; a screen shorter still opens the window maximised and the panels scroll.
+    param($Form, $Outer, $Strip, $Tabs, [System.Drawing.Rectangle]$Screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea)
+    $need = 0
+    foreach ($p in @($script:Gui['RightPanels'])) {
+        $bottom = 0
+        foreach ($c in $p.Controls) {
+            $h = $c.Height
+            if ($c -is [System.Windows.Forms.Label] -and $c.AutoSize) { $h = [Math]::Max($h, $c.PreferredSize.Height) }   # a wrapped legend
+            $bottom = [Math]::Max($bottom, $c.Top + $h)
+        }
+        $chrome = 0; foreach ($c in $p.Parent.Controls) { if ([string]$c.Dock -eq 'Top') { $chrome += $c.Height } }   # banner + toolbar
+        $need = [Math]::Max($need, $chrome + $bottom + $p.Padding.Bottom + 6)
+    }
+    $fixed = ($Tabs.ItemSize.Height + 8) + $Outer.SplitterWidth + $Strip.Height + ($Form.Size.Height - $Form.ClientSize.Height)
+    $log = 220
+    $max = $false
+    if ($need + $fixed + $log -gt $Screen.Height) {
+        $log = [Math]::Max(120, $Screen.Height - $need - $fixed)
+        if ($need + $fixed + $log -gt $Screen.Height) { $max = $true }
+    }
+    $height = [Math]::Max($Form.MinimumSize.Height, [Math]::Min($Screen.Height, $need + $fixed + $log))
+    $width = [Math]::Max($Form.MinimumSize.Width, [Math]::Min(1600, $Screen.Width))
+    return [pscustomobject]@{ Width = $width; Height = $height; Log = $log; PanelNeed = $need; Maximised = $max; Screen = $Screen }
+}
+
+function Register-ConsoleTab {
+    # Creates a TabPage whose header is painted in the console colour (see the DrawItem handler).
+    param($Tabs, [string]$Console, [string]$Text)
+    $page = New-Object System.Windows.Forms.TabPage
+    $page.Text = $Text; $page.Tag = $Console; $page.BackColor = 'White'
+    $Tabs.TabPages.Add($page)
+    return $page
+}
+
+# ---------------------------------------------------------------------
+#  The window
+# ---------------------------------------------------------------------
+function Show-ToolkitGui {
+    param([switch]$NoShow, [int]$AutoCloseSeconds = 0)   # -NoShow builds the form without displaying it; -AutoCloseSeconds shows it and closes it again (both to check the window without an operator)
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
-    $script:Gui = @{ Buttons = @(); Busy = $false; Tips = (New-Object System.Windows.Forms.ToolTip) }
+    $script:Gui = @{ Buttons = @(); Busy = $false; Tips = (New-Object System.Windows.Forms.ToolTip); RefreshByConsole = [ordered]@{}; Stale = @{}; GroupCombos = @(); OnFirstShow = @{}; RightPanels = @() }
     $font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "$($script:Config.OperatorName)'s Patch Palace - Offline Server 2022 patching over WinRM"
-    $form.Size = New-Object System.Drawing.Size(1300, 860)
-    $form.MinimumSize = New-Object System.Drawing.Size(1000, 700)
+    $form.Text = "$($script:Config.OperatorName)'s $($script:Config.ToolName) $($script:Config.ToolVersion) - offline, WinRM 5985 only"
+    $form.Size = New-Object System.Drawing.Size(1360, 900)
+    $form.MinimumSize = New-Object System.Drawing.Size(1100, 720)
     $form.StartPosition = 'CenterScreen'
     $form.Font = $font
     $script:Gui['Form'] = $form
 
-    $tabs = New-Object System.Windows.Forms.TabControl
-    $tabs.Dock = 'Fill'
-    $tabMain = New-Object System.Windows.Forms.TabPage; $tabMain.Text = '  Patch Console  '
-    $tabTour = New-Object System.Windows.Forms.TabPage; $tabTour.Text = '  Code Tour - how it works  '
-    $tabs.TabPages.AddRange(@($tabMain, $tabTour))
-
-    # ---------------- status bar (added first so it docks at the very bottom) ----------------
+    # ---- status bar (bottom) ----
     $strip = New-Object System.Windows.Forms.StatusStrip
     $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
     $statusLabel.Text = 'Ready.'; $statusLabel.Spring = $true; $statusLabel.TextAlign = 'MiddleLeft'
     $progress = New-Object System.Windows.Forms.ToolStripProgressBar
     $progress.Size = New-Object System.Drawing.Size(220, 16); $progress.ToolTipText = 'Patch-o-meter'
-    [void]$strip.Items.Add($statusLabel); [void]$strip.Items.Add($progress)
-    $script:Gui['StatusLabel'] = $statusLabel; $script:Gui['Progress'] = $progress
+    # Stop: shown only while a read-only collector runs - the servers that have not answered are given up (nothing is
+    # changed on them); an install is never stoppable from here (06-Install waits its own way and never stops a job)
+    $stop = New-Object System.Windows.Forms.ToolStripButton
+    $stop.Text = 'Stop waiting'; $stop.Visible = $false; $stop.ToolTipText = 'Give up on the servers that have not answered yet (read-only checks only; nothing is changed on them)'
+    $stop.Add_Click({ $script:Gui['StopRequested'] = $true; $this.Enabled = $false; $this.Text = 'stopping...' })
+    [void]$strip.Items.Add($statusLabel); [void]$strip.Items.Add($stop); [void]$strip.Items.Add($progress)
+    $script:Gui['StatusLabel'] = $statusLabel; $script:Gui['Progress'] = $progress; $script:Gui['StopButton'] = $stop
 
-    # ================= MAIN TAB =================
-    # Fill control first, then the docked edges (WinForms docks the last-added control first).
-    $split = New-Object System.Windows.Forms.SplitContainer
-    $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'
-    $tabMain.Controls.Add($split)
-
-    $lv = New-Object System.Windows.Forms.ListView
-    $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.GridLines = $true
-    $lv.Dock = 'Fill'; $lv.HideSelection = $false; $lv.ShowItemToolTips = $true
-    $lv.Add_DoubleClick({
-        if ($script:Gui['Busy']) { Write-PatchLog 'Busy - the details window is available again when the current action finishes' 'WARN'; return }
-        if ($lv.SelectedItems.Count -gt 0) { Show-ServerDetails -Name $lv.SelectedItems[0].Text }
+    # ---- tabs on top, shared log underneath ----
+    $outer = New-Object System.Windows.Forms.SplitContainer
+    $outer.Dock = 'Fill'; $outer.Orientation = 'Horizontal'
+    $outer.FixedPanel = 'Panel2'   # the log keeps its height when the window is resized or maximised; the consoles grow
+    $tabs = New-Object System.Windows.Forms.TabControl
+    # eight tabs of 132 px fit the narrowest window (MinimumSize 1100) without scroll arrows
+    $tabs.Dock = 'Fill'; $tabs.DrawMode = 'OwnerDrawFixed'; $tabs.ItemSize = New-Object System.Drawing.Size(132, 30); $tabs.SizeMode = 'Fixed'
+    # The tab headers are bold, but a Font set on the TabControl is inherited by every page and every grid on
+    # it - so the header font is kept separately and used only by the DrawItem handler below.
+    $script:Gui['TabHeaderFont'] = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $tabs.Add_DrawItem({
+        param($src, $e)   # ($sender is an automatic variable: not a name to take)
+        $page = $src.TabPages[$e.Index]
+        $back = $script:Config.ConsoleColours[[string]$page.Tag]; if (-not $back) { $back = 'Gray' }
+        $fore = $script:Config.ConsoleText[[string]$page.Tag]; if (-not $fore) { $fore = 'White' }
+        $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromName($back))
+        $e.Graphics.FillRectangle($brush, $e.Bounds)
+        if ($e.Index -eq $src.SelectedIndex) { $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromName($fore), 3); $e.Graphics.DrawLine($pen, $e.Bounds.Left, $e.Bounds.Bottom - 2, $e.Bounds.Right, $e.Bounds.Bottom - 2) }
+        $fmt = New-Object System.Drawing.StringFormat; $fmt.Alignment = 'Center'; $fmt.LineAlignment = 'Center'
+        $e.Graphics.DrawString($page.Text, $script:Gui['TabHeaderFont'], (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromName($fore))), [System.Drawing.RectangleF]::op_Implicit($e.Bounds), $fmt)
     })
-    $lv.Add_ItemChecked({ $script:Gui['CountLabel'].Text = ('{0} server row(s) shown, {1} ticked' -f $lv.Items.Count, (Get-CheckedServers).Count) })
-    $split.Panel1.Controls.Add($lv)
-    $script:Gui['ServerList'] = $lv
+    $tabs.Add_SelectedIndexChanged({
+        $p = $this.SelectedTab; if (-not $p) { return }
+        Set-GuiStatus ("{0} console" -f $p.Text)
+        Update-StaleConsole -Console ([string]$p.Tag)
+        $first = $script:Gui['OnFirstShow'][[string]$p.Tag]   # a console that builds its page only when first opened (About, Commands)
+        # not while a read-only action already runs nested (the page's action would be refused and the entry lost): the next visit builds it
+        if ($first -and -not $script:Gui['NestedBusy']) { $script:Gui['OnFirstShow'].Remove([string]$p.Tag); & $first }
+    })
+    $outer.Panel1.Controls.Add($tabs)
+    $script:Gui['Tabs'] = $tabs
 
     $logBox = New-Object System.Windows.Forms.RichTextBox
     $logBox.Dock = 'Fill'; $logBox.ReadOnly = $true; $logBox.BackColor = 'White'; $logBox.WordWrap = $false
     $logBox.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $split.Panel2.Controls.Add($logBox)
+    $outer.Panel2.Controls.Add($logBox)
     $script:Gui['LogBox'] = $logBox
-
-    # ---- right panel: patches + the big buttons ----
-    $right = New-Object System.Windows.Forms.Panel
-    $right.Dock = 'Right'; $right.Width = 350; $right.Padding = New-Object System.Windows.Forms.Padding(8)
-    $tabMain.Controls.Add($right)
-
-    $lblP = New-Object System.Windows.Forms.Label
-    $lblP.Text = 'Patches found in \patches  (tick the ones to install):'; $lblP.Location = New-Object System.Drawing.Point(10, 8); $lblP.AutoSize = $true
-    $right.Controls.Add($lblP)
-    $patchList = New-Object System.Windows.Forms.CheckedListBox
-    $patchList.Location = New-Object System.Drawing.Point(10, 30); $patchList.Size = New-Object System.Drawing.Size(325, 150); $patchList.CheckOnClick = $true
-    $right.Controls.Add($patchList)
-    $script:Gui['PatchList'] = $patchList
-    $lblFolder = New-Object System.Windows.Forms.Label
-    $lblFolder.Location = New-Object System.Drawing.Point(10, 184); $lblFolder.Size = New-Object System.Drawing.Size(325, 32); $lblFolder.ForeColor = 'Gray'
-    $right.Controls.Add($lblFolder)
-    $script:Gui['PatchFolderLabel'] = $lblFolder
-
-    $right.Controls.Add((New-GuiButton -Text 'Open patches' -X 10 -Y 218 -W 100 -ReadOnly -Tip 'Opens the \patches folder in Explorer' -OnClick { Invoke-Item -LiteralPath $script:Config.PatchFolder }))
-    $right.Controls.Add((New-GuiButton -Text 'Today''s log' -X 115 -Y 218 -W 100 -ReadOnly -Tip 'Opens logs\Patcher-YYYYMMDD.log in Notepad' -OnClick {
-        if (-not (Test-Path -LiteralPath (Get-PatchLogPath))) { Write-PatchLog 'Log file created' 'INFO' }
-        Start-Process notepad.exe -ArgumentList ('"{0}"' -f (Get-PatchLogPath)) }))
-    $right.Controls.Add((New-GuiButton -Text 'Where do I get patches?' -X 220 -Y 218 -W 115 -ReadOnly -Tip 'Update history page -> KB number -> Microsoft Update Catalog -> \patches' -OnClick {
-        $null = Show-PatcherMessage -Title 'Finding and downloading patches' -Text $script:PatchHowTo }))
-
-    $btnPatch = New-GuiButton -Text 'PATCH IT!  (ticked KBs -> ticked servers)' -X 10 -Y 268 -W 325 -H 60 -Colour 'Tomato' -Tip 'Runs the pre-flight, shows the plan, then the two safety pop-ups' -OnClick {
-        Invoke-GuiAction -Name 'Install' -Action {
-            $servers = Get-CheckedServers; $patches = Get-CheckedPatches
-            if ($servers.Count -eq 0) { $null = Show-PatcherMessage -Text 'Tick at least one server first.' -Icon 'Warning'; return }
-            if ($patches.Count -eq 0) { $null = Show-PatcherMessage -Text 'Tick at least one patch first.' -Icon 'Warning'; return }
-            # Only real result objects count (anything else in the output stream would be a leaked pop-up value).
-            $results = @(Install-PatchOnServers -ComputerName $servers -Patches $patches | Where-Object { $_ -is [psobject] -and $_.PSObject.Properties['Success'] })
-            if ($results.Count -gt 0) {
-                $good = @($results | Where-Object { $_.Success }).Count
-                $bad  = @($results | Where-Object { -not $_.Success }).Count
-                $reb  = @($results | Where-Object { $_.RebootRequired }).Count
-                if ($bad -eq 0) { Write-PatchLog ('   \o/  All installs succeeded. Nice one, {0}!' -f $script:Config.OperatorName) 'OK' }
-                $null = Show-PatcherMessage -Title 'Install finished' -Text ("Installed OK: {0}`nFailed or unknown: {1}`nNeed a reboot: {2}`n`nDetails are in the log. Reboot with the 'Reboot ticked servers' button when you are ready." -f $good, $bad, $reb)
-            }
-        }
+    # the WARN / ERROR lines of the start-up (settings.json skipped a value, a safeguard switched off): shown first, so the
+    # operator who never looks at the console window sees them
+    foreach ($pre in @($script:PreGuiLines)) {
+        if (-not $pre) { continue }
+        $logBox.SelectionStart = $logBox.TextLength; $logBox.SelectionLength = 0
+        $logBox.SelectionColor = [System.Drawing.Color]::FromName($(if ($pre[0] -eq 'ERROR') { 'Red' } else { 'DarkOrange' }))
+        $logBox.AppendText([string]$pre[1] + "`r`n")
     }
-    $btnPatch.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
-    $right.Controls.Add($btnPatch)
+    $script:PreGuiLines = @()
 
-    $right.Controls.Add((New-GuiButton -Text 'Reboot ticked servers' -X 10 -Y 338 -W 325 -H 34 -Colour 'Khaki' -Tip 'Fresh status first; only servers PENDING a reboot by default; refused while DISM is running.' -OnClick {
-        Invoke-GuiAction -Name 'Reboot' -Action {
-            $servers = Get-CheckedServers
-            if ($servers.Count -eq 0) { $null = Show-PatcherMessage -Text 'Tick at least one server first.' -Icon 'Warning'; return }
-            Restart-PatchedServers -ComputerName $servers
-        }
-    }))
-    $right.Controls.Add((New-GuiButton -Text 'Test WinRM port (no auth) on ticked' -X 10 -Y 378 -W 325 -H 30 -ReadOnly -Tip 'Test-WSMan: is 5985 open and answering? Needs no credentials. Works during an install.' -OnClick {
-        Invoke-GuiAction -Name 'WinRM test' -ReadOnly -Action {
-            $servers = Get-CheckedServers
-            if ($servers.Count -eq 0) { $null = Show-PatcherMessage -Text 'Tick at least one server first.' -Icon 'Warning'; return }
-            foreach ($s in $servers) { Test-ServerWinRM -ComputerName $s | Out-Null }
-        }
-    }))
+    # ---- the consoles, in tab order ----
+    New-PatchingConsole -Tabs $tabs
+    New-SoftwareConsole -Tabs $tabs
+    New-HealthConsole -Tabs $tabs
+    New-SecurityConsole -Tabs $tabs
+    New-CommandsConsole -Tabs $tabs
+    New-CodeTourTab -Tabs $tabs
+    New-SettingsConsole -Tabs $tabs
+    New-AboutConsole -Tabs $tabs
+    Update-TrellixShown   # TrellixInUse off: the Trellix boxes and buttons go before the window is sized
 
-    $legend = New-Object System.Windows.Forms.Label
-    $legend.Location = New-Object System.Drawing.Point(10, 420); $legend.Size = New-Object System.Drawing.Size(325, 190); $legend.ForeColor = 'DimGray'
-    $legend.Text = @"
-Row colours:
-  White        - not checked yet
-  Grey         - WinRM failed (hover for the reason)
-  Pink         - pending reboot = cannot patch
-  Yellow       - at least one KB is READY to install
-  Green        - every KB in \patches is installed
-
-KB columns: Installed / Installed (history) / READY /
-  Blocked: reboot / servicing / disk / signature /
-  OS unknown / wrong OS  /  ? = unreachable
-Build = real patch level. "PFRO only, ignored" = a weak
-reboot hint, not counted (Code Tour explains).
-Double-click a row for full details.
-While an install runs: status checks, WinRM test, the
-group box and the log still work; the rest is locked.
-Console window behind me = the same log, in colour.
-"@
-    $right.Controls.Add($legend)
-
-    # ---- toolbar ----
-    $toolbar = New-Object System.Windows.Forms.Panel
-    $toolbar.Dock = 'Top'; $toolbar.Height = 44
-    $tabMain.Controls.Add($toolbar)
-    $lblG = New-Object System.Windows.Forms.Label; $lblG.Text = 'Group:'; $lblG.Location = New-Object System.Drawing.Point(8, 13); $lblG.AutoSize = $true
-    $toolbar.Controls.Add($lblG)
-    $combo = New-Object System.Windows.Forms.ComboBox
-    $combo.Location = New-Object System.Drawing.Point(55, 9); $combo.Width = 170; $combo.DropDownStyle = 'DropDownList'
-    $combo.Add_SelectedIndexChanged({ Update-ServerList })
-    $toolbar.Controls.Add($combo)
-    $script:Gui['GroupCombo'] = $combo
-
-    $toolbar.Controls.Add((New-GuiButton -Text 'Reload lists + patches' -X 235 -Y 8 -W 150 -Tip 'Re-reads the *.txt group files and the patches folder' -OnClick {
-        Invoke-GuiAction -Name 'Reload' -Action { Initialize-PatcherData }
-    }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Check status (ticked)' -X 390 -Y 8 -W 150 -Colour 'LightSkyBlue' -ReadOnly -Tip 'WinRM status check of the ticked servers. Works during an install.' -OnClick {
-        Invoke-GuiAction -Name 'Status check' -ReadOnly -Action {
-            $servers = Get-CheckedServers
-            if ($servers.Count -eq 0) { $null = Show-PatcherMessage -Text 'Tick at least one server first (or use "Check ALL shown").' -Icon 'Warning'; return }
-            Get-ServerStatus -ComputerName $servers | Out-Null
-        }
-    }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Check ALL shown' -X 545 -Y 8 -W 120 -Colour 'LightSkyBlue' -ReadOnly -Tip 'Works during an install.' -OnClick {
-        Invoke-GuiAction -Name 'Status check' -ReadOnly -Action {
-            $all = @(Get-UniqueNames ($script:Gui['ServerList'].Items | ForEach-Object { $_.Text }))
-            if ($all.Count -eq 0) { $null = Show-PatcherMessage -Text 'No servers in the list. Add names to a PatchGroup-*.txt file and reload.' -Icon 'Warning'; return }
-            Get-ServerStatus -ComputerName $all | Out-Null
-        }
-    }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Tick all shown' -X 680 -Y 8 -W 100 -ReadOnly -OnClick { foreach ($i in $script:Gui['ServerList'].Items) { $i.Checked = $true } }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Untick all' -X 785 -Y 8 -W 90 -ReadOnly -OnClick { foreach ($i in $script:Gui['ServerList'].Items) { $i.Checked = $false } }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Set credentials' -X 890 -Y 8 -W 110 -Tip 'Foreground Get-Credential prompt. Only needed if your login is refused.' -OnClick { Get-PatcherCredential -Reason 'alternate account for WinRM' | Out-Null }))
-    $toolbar.Controls.Add((New-GuiButton -Text 'Clear creds' -X 1005 -Y 8 -W 85 -OnClick { Clear-PatcherCredential }))
-    $countLabel = New-Object System.Windows.Forms.Label
-    $countLabel.Location = New-Object System.Drawing.Point(1100, 13); $countLabel.AutoSize = $true; $countLabel.ForeColor = 'DimGray'
-    $toolbar.Controls.Add($countLabel)
-    $script:Gui['CountLabel'] = $countLabel
-
-    # ---- banner ----
-    $banner = New-Object System.Windows.Forms.Panel
-    $banner.Dock = 'Top'; $banner.Height = 64; $banner.BackColor = 'MidnightBlue'
-    $tabMain.Controls.Add($banner)
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = "$($script:Config.OperatorName.ToUpper())'S PATCH PALACE"; $title.ForeColor = 'Gold'; $title.AutoSize = $true
-    $title.Font = New-Object System.Drawing.Font('Segoe UI', 20, [System.Drawing.FontStyle]::Bold)
-    $title.Location = New-Object System.Drawing.Point(12, 6)
-    $title.Add_Click({ $script:Gui['QuipLabel'].Text = Get-RandomQuip })
-    $banner.Controls.Add($title)
-    $quip = New-Object System.Windows.Forms.Label
-    $quip.Text = Get-RandomQuip; $quip.ForeColor = 'White'; $quip.AutoSize = $true
-    $quip.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic)
-    $quip.Location = New-Object System.Drawing.Point(400, 24)
-    $banner.Controls.Add($quip)
-    $script:Gui['QuipLabel'] = $quip
-    $split.BringToFront()
-
-    # ================= CODE TOUR TAB =================
-    $tourSplit = New-Object System.Windows.Forms.SplitContainer
-    $tourSplit.Dock = 'Fill'; $tourSplit.Orientation = 'Vertical'
-    $tabTour.Controls.Add($tourSplit)
-    $tourList = New-Object System.Windows.Forms.ListBox
-    $tourList.Dock = 'Fill'; $tourList.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-    foreach ($entry in $script:CodeTour) { [void]$tourList.Items.Add($entry.Title) }
-    $tourSplit.Panel1.Controls.Add($tourList)
-    $tourText = New-Object System.Windows.Forms.RichTextBox
-    $tourText.Dock = 'Fill'; $tourText.ReadOnly = $true; $tourText.BackColor = 'White'; $tourText.WordWrap = $false
-    $tourText.Font = New-Object System.Drawing.Font('Consolas', 10)
-
-    # Picture entries: a panel above the text that holds the PNG (hidden for text-only entries).
-    $picHost = New-Object System.Windows.Forms.Panel
-    $picHost.Dock = 'Top'; $picHost.Height = 420; $picHost.Visible = $false; $picHost.BackColor = 'White'
-    $picBar = New-Object System.Windows.Forms.Panel
-    $picBar.Dock = 'Top'; $picBar.Height = 30
-    $picActual = New-Object System.Windows.Forms.CheckBox
-    $picActual.Text = 'Actual size (scroll)'; $picActual.Location = New-Object System.Drawing.Point(8, 6); $picActual.AutoSize = $true
-    $picActual.Add_CheckedChanged({ Set-CodeTourPictureMode })
-    $picOpen = New-Object System.Windows.Forms.Button
-    $picOpen.Text = 'Open picture'; $picOpen.Location = New-Object System.Drawing.Point(160, 3); $picOpen.Size = New-Object System.Drawing.Size(100, 24)
-    $picOpen.Add_Click({ if ($script:Gui['TourPicPath']) { Start-Process $script:Gui['TourPicPath'] } })
-    $picLabel = New-Object System.Windows.Forms.Label
-    $picLabel.Location = New-Object System.Drawing.Point(275, 8); $picLabel.AutoSize = $true; $picLabel.ForeColor = 'DimGray'
-    $picBar.Controls.AddRange(@($picActual, $picOpen, $picLabel))
-    $picScroll = New-Object System.Windows.Forms.Panel
-    $picScroll.Dock = 'Fill'; $picScroll.AutoScroll = $true
-    $pic = New-Object System.Windows.Forms.PictureBox
-    $pic.Dock = 'Fill'; $pic.SizeMode = 'Zoom'
-    $pic.Add_DoubleClick({ if ($script:Gui['TourPicPath']) { Start-Process $script:Gui['TourPicPath'] } })
-    $picScroll.Controls.Add($pic)
-    $picHost.Controls.Add($picScroll); $picHost.Controls.Add($picBar)
-    $picScroll.BringToFront()
-
-    $tourSplit.Panel2.Controls.Add($tourText)
-    $tourSplit.Panel2.Controls.Add($picHost)
-    $tourText.BringToFront()
-    $tourSplit.Panel2.Add_Resize({ Set-CodeTourPictureSize })
-    $tourList.Add_SelectedIndexChanged({
-        $entry = $script:CodeTour[$tourList.SelectedIndex]
-        if ($entry) { Show-CodeTourEntry -Entry $entry }
-    })
-    $script:Gui['TourList'] = $tourList; $script:Gui['TourText'] = $tourText; $script:Gui['TourPanel2'] = $tourSplit.Panel2
-    $script:Gui['TourPicHost'] = $picHost; $script:Gui['TourPic'] = $pic; $script:Gui['TourPicLabel'] = $picLabel
-    $script:Gui['TourPicScroll'] = $picScroll; $script:Gui['TourPicActual'] = $picActual
-
-    $form.Controls.Add($tabs)
+    $form.Controls.Add($outer)
     $form.Controls.Add($strip)
-    $tabs.BringToFront()
+    $outer.BringToFront()
     $form.Add_Shown({
-        try { $split.SplitterDistance = [int]($split.Height * 0.6); $tourSplit.SplitterDistance = 300 } catch { }
-        $tourList.SelectedIndex = 0
+        try { $outer.SplitterDistance = [Math]::Max(300, $outer.Height - [int]$script:Gui['LogHeight'] - $outer.SplitterWidth) } catch { }   # the log underneath (Get-ToolkitStartSize), draggable
+        try { $script:Gui['TourSplit'].SplitterDistance = 450 } catch { }   # the longest topic title plus the menu's scroll bar
+        Select-CodeTourTopic -Index 0
     })
     # Closing the window while a copy or install is running would leave sessions and DISM to their fate.
     $form.Add_FormClosing({
         if ($script:Gui['Busy']) {
             $_.Cancel = $true
-            Write-PatchLog "Close refused - still busy with '$($script:Gui['BusyName'])'. Wait for it to finish, then close." 'WARN'
-            $null = Show-PatcherMessage -Text "Still busy with '$($script:Gui['BusyName'])'. Wait for it to finish before closing." -Title 'Busy' -Icon 'Warning'
+            Write-PatchLog "Close refused - still busy with '$($script:Gui['BusyName'])'. Wait for it to finish, then close. (During an install: untick Auto-check or press 'Let the servers go' - the servers carry on by themselves and a later status check records the results.)" 'WARN'
+            Set-GuiStatus "Close refused - '$($script:Gui['BusyName'])' is still running"   # no pop-up: a modal dialog would pause the install's progress loop
+            return
+        }
+        # a timed close (-AutoCloseSeconds) must not stop at this question
+        if ($script:Gui['SettingsDirty'] -and -not $script:Gui['AutoCloseTimer']) {
+            $a = Show-PatcherMessage -Title 'Unsaved settings' -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2' -Text "The Settings tab has changes that are not saved.`n`nClose anyway and lose them?"
+            if ($a -ne 'Yes') { $_.Cancel = $true; $script:Gui['Tabs'].SelectedTab = @($script:Gui['Tabs'].TabPages | Where-Object { $_.Tag -eq 'Settings' })[0] }
+            else { Write-PatchLog 'Closed with unsaved changes on the Settings tab - they were not saved' 'WARN' }
         }
     })
 
     # ---- load the data and go ----
-    Write-PatchLog ("Welcome, {0}! Root folder = {1}   (running as {2})" -f $script:Config.OperatorName, $script:RootFolder, (Get-OperatorIdentity)) 'INFO'
-    Initialize-PatcherData
+    Write-PatchLog ("Welcome, {0}! {1} {2}, root folder = {3}   (running as {4})" -f $script:Config.OperatorName, $script:Config.ToolName, $script:Config.ToolVersion, $script:RootFolder, (Get-OperatorIdentity)) 'INFO'
+    Initialize-ToolkitData
+    # the first size: every button of the right-hand panels in view (measured after the data is in: the NEW box moves them)
+    $size = Get-ToolkitStartSize -Form $form -Outer $outer -Strip $strip -Tabs $tabs
+    $form.Size = New-Object System.Drawing.Size($size.Width, $size.Height)
+    if ($size.Maximised) { $form.WindowState = 'Maximized' }
+    $script:Gui['LogHeight'] = $size.Log
+    $script:Gui['StartSize'] = $size
+    try { $form.PerformLayout(); $outer.SplitterDistance = [Math]::Max(300, $outer.Height - $size.Log - $outer.SplitterWidth) } catch { }   # before the first paint, so nothing jumps
     if ($NoShow) { return $form }
+    if ($AutoCloseSeconds -gt 0) {
+        # -AutoCloseSeconds: show the window for real so every Shown / paint / selection handler runs, then close it
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = $AutoCloseSeconds * 1000
+        $timer.Add_Tick({ $this.Stop(); $script:Gui['Form'].Close() })
+        $timer.Start()
+        $script:Gui['AutoCloseTimer'] = $timer
+    }
     Write-PatchLog 'GUI is open. This console window keeps a colour copy of everything.' 'INFO'
     try {
         [void]$form.ShowDialog()
     } finally {
         $form.Dispose()
-        # In paste / Invoke-Expression mode $script: is the console's global scope - do not leave a password behind.
+        # When the launcher was dot-sourced ($NoGui), $script: is the console's own scope - do not leave a password behind.
         if ($script:Credential) { Clear-PatcherCredential }
         Write-PatchLog 'GUI closed. Bye!' 'INFO'
     }
 }
 
-function Show-CodeTourEntry {
-    # Fills the Code Tour right-hand side: the explanation (+ live source) and, for picture entries, the PNG.
-    param($Entry)
-    $text = $script:Gui['TourText']; $picHost = $script:Gui['TourPicHost']; $pic = $script:Gui['TourPic']
-    $text.Text = Get-CodeTourText -Entry $Entry
-    if ($pic.Image) { $old = $pic.Image; $pic.Image = $null; $old.Dispose() }
-    if ($script:Gui['TourPicStream']) { $script:Gui['TourPicStream'].Dispose(); $script:Gui['TourPicStream'] = $null }
-    $script:Gui['TourPicPath'] = $null
-    if (-not $Entry.Image) { $picHost.Visible = $false; return }
-
-    $path = Join-Path $script:RootFolder $Entry.Image
-    if (-not (Test-Path -Path $path)) {
-        $text.Text = "PICTURE NOT FOUND: $path`r`nRun Build-Diagrams.ps1 in the root folder to draw it, then come back.`r`n`r`n" + $text.Text
-        $picHost.Visible = $false
-        return
-    }
-    # Load through a MemoryStream so the PNG file is not locked while the GUI is open.
-    $stream = New-Object System.IO.MemoryStream -ArgumentList (, [System.IO.File]::ReadAllBytes($path))
-    $pic.Image = [System.Drawing.Image]::FromStream($stream)
-    $script:Gui['TourPicStream'] = $stream
-    $script:Gui['TourPicPath'] = $path
-    $script:Gui['TourPicLabel'].Text = ('{0}   {1}x{2} px   (double-click the picture to open it full size)' -f $Entry.Image, $pic.Image.Width, $pic.Image.Height)
-    $picHost.Visible = $true
-    Set-CodeTourPictureMode
-    Set-CodeTourPictureSize
-}
-
-function Set-CodeTourPictureSize {
-    # The picture takes the top of the panel, the caption keeps about 190 px underneath.
-    $picHost = $script:Gui['TourPicHost']; $panel = $script:Gui['TourPanel2']
-    if (-not $picHost -or -not $picHost.Visible) { return }
-    $picHost.Height = [math]::Max(200, $panel.ClientSize.Height - 190)
-}
-
-function Set-CodeTourPictureMode {
-    # Zoom-to-fit (default) or actual size with scroll bars.
-    $pic = $script:Gui['TourPic']; $scroll = $script:Gui['TourPicScroll']; $actual = $script:Gui['TourPicActual']
-    if (-not $pic) { return }
-    if ($actual.Checked) {
-        $pic.Dock = 'None'; $pic.SizeMode = 'AutoSize'; $pic.Location = New-Object System.Drawing.Point(0, 0)
-        $scroll.AutoScroll = $true
-    } else {
-        $pic.Dock = 'Fill'; $pic.SizeMode = 'Zoom'
-        $scroll.AutoScroll = $false
-    }
-}
-
-function Initialize-PatcherData {
-    # Reads the group files and the patch folder, then refreshes both lists.
+function Initialize-ToolkitData {
+    # Reads the group files and the patch folders, fills every group combo, then lets each console repaint.
     Get-PatchGroups | Out-Null
     Get-PatchFiles  | Out-Null
-    $combo = $script:Gui['GroupCombo']
-    $keep = [string]$combo.SelectedItem
-    $combo.Items.Clear()
-    [void]$combo.Items.Add('(all groups)')
-    foreach ($g in $script:Groups) { [void]$combo.Items.Add($g.Name) }
-    if ($keep -and $combo.Items.Contains($keep)) { $combo.SelectedItem = $keep } else { $combo.SelectedIndex = 0 }
-    Update-PatchList
-    Update-ServerList
+    Get-SoftwarePackageFiles | Out-Null
+    Clear-CheckRowCache   # class: and soe: on the group lines feed the checks
+    foreach ($combo in @($script:Gui['GroupCombos'])) {
+        $keep = [string]$combo.SelectedItem
+        $combo.Items.Clear()
+        [void]$combo.Items.Add('(all groups)')
+        foreach ($g in $script:Groups) { [void]$combo.Items.Add($g.Name) }
+        if ($keep -and $combo.Items.Contains($keep)) { $combo.SelectedItem = $keep } else { $combo.SelectedIndex = 0 }
+    }
+    Invoke-ConsoleRefresh
+}
+
+# ---------------------------------------------------------------------
+#  Code Tour tab: the topics by part on the left, each topic as an HTML page on the right.
+# ---------------------------------------------------------------------
+function New-CodeTourTab {
+    # The menu on the left is a tree: one bold node per part (A-F), one node per topic with its whole title.
+    # The right side shows the topic as an HTML page (Get-CodeTourHtml): the explanation, the picture, the live source.
+    param($Tabs)
+    $tabTour = Register-ConsoleTab -Tabs $Tabs -Console 'Tour' -Text 'Code Tour'
+    $tourSplit = New-Object System.Windows.Forms.SplitContainer
+    $tourSplit.Dock = 'Fill'; $tourSplit.Orientation = 'Vertical'; $tourSplit.FixedPanel = 'Panel1'
+    $tabTour.Controls.Add($tourSplit)
+    # A TreeView clips a node drawn in a wider font than its own, so the TREE font is the bold one (part headings)
+    # and the topics get the regular font, which is narrower.
+    $bold = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $regular = New-Object System.Drawing.Font('Segoe UI', 10)
+    $tree = New-Object System.Windows.Forms.TreeView
+    $tree.Dock = 'Fill'; $tree.Font = $bold; $tree.HideSelection = $false; $tree.FullRowSelect = $true; $tree.ShowLines = $false
+    $tree.ItemHeight = 26; $tree.Indent = 16; $tree.BackColor = 'White'
+    $nodes = New-Object 'System.Windows.Forms.TreeNode[]' (@($script:CodeTour).Count)
+    foreach ($key in $script:CodeTourParts.Keys) {
+        $partNode = $tree.Nodes.Add(('Part {0} - {1}' -f $key, $script:CodeTourParts[$key]))
+        for ($i = 0; $i -lt @($script:CodeTour).Count; $i++) {
+            if ((Get-CodeTourPart -Entry $script:CodeTour[$i]) -ne $key) { continue }
+            $n = $partNode.Nodes.Add([string]$script:CodeTour[$i].Title); $n.Tag = $i; $n.NodeFont = $regular; $nodes[$i] = $n
+        }
+    }
+    $tree.ExpandAll()
+    # Handlers run long after this function has returned, so they read $this, $_ or $script:Gui - never a local here.
+    $tree.Add_AfterSelect({
+        $n = $_.Node
+        if ($null -eq $n.Tag) { if ($n.Nodes.Count -gt 0) { $this.SelectedNode = $n.Nodes[0] }; return }   # a part heading opens its first topic
+        Show-CodeTourEntry -Index ([int]$n.Tag)
+    })
+    $tourSplit.Panel1.Controls.Add($tree)
+
+    $bar = New-Object System.Windows.Forms.Panel; $bar.Dock = 'Top'; $bar.Height = 40; $bar.BackColor = 'WhiteSmoke'
+    $bar.Controls.Add((New-GuiButton -Text '< Previous' -X 8 -Y 6 -W 95 -H 28 -ReadOnly -OnClick { Select-CodeTourTopic -Index ([int]$script:Gui['TourIndex'] - 1) }))
+    $bar.Controls.Add((New-GuiButton -Text 'Next >' -X 108 -Y 6 -W 95 -H 28 -ReadOnly -OnClick { Select-CodeTourTopic -Index ([int]$script:Gui['TourIndex'] + 1) }))
+    $picButton = New-GuiButton -Text 'Open picture' -X 218 -Y 6 -W 110 -H 28 -ReadOnly -Tip 'The picture full size in the Windows photo viewer' -OnClick {
+        Invoke-GuiAction -Name 'Open picture' -ReadOnly -Action {
+            $e = $script:CodeTour[[int]$script:Gui['TourIndex']]
+            if ($e -and $e.Image) { $p = Join-Path $script:RootFolder $e.Image; if (Test-Path -LiteralPath $p) { Start-Process $p } }
+        } }
+    $bar.Controls.Add($picButton)
+    $bar.Controls.Add((New-GuiButton -Text 'Save page as HTML...' -X 333 -Y 6 -W 150 -H 28 -ReadOnly -Tip 'This topic as one HTML file (picture included) - to read in a browser or print' -OnClick {
+        Invoke-GuiAction -Name 'Save tour page' -ReadOnly -Action {
+            if (-not (Test-GuiDialogAllowed 'The save dialog')) { return }
+            $title = [string]$script:CodeTour[[int]$script:Gui['TourIndex']].Title
+            $p = Save-HtmlAs -Html $script:Gui['TourHtml'] -BaseName ('CodeTour-' + ($title -split '\.')[0]) -Owner $script:Gui['Form'] -What 'topic'
+            if ($p) { $script:Gui['TourPosition'].Text = 'Saved: ' + $p }
+        } }))
+    $bar.Controls.Add((New-GuiButton -Text 'Save whole tour as HTML...' -X 488 -Y 6 -W 185 -H 28 -ReadOnly -Tip 'Every topic in one HTML file with a contents list - for training or printing' -OnClick {
+        Invoke-GuiAction -Name 'Save whole tour' -ReadOnly -Action {
+            if (-not (Test-GuiDialogAllowed 'The save dialog')) { return }
+            $p = Save-HtmlAs -Html (Export-CodeTourHtml) -BaseName 'CodeTour-all' -Owner $script:Gui['Form'] -What 'tour'
+            if ($p) { $script:Gui['TourPosition'].Text = 'Saved: ' + $p }
+        } }))
+    $pos = New-Object System.Windows.Forms.Label; $pos.Location = New-Object System.Drawing.Point(685, 12); $pos.AutoSize = $true; $pos.ForeColor = 'DimGray'
+    $bar.Controls.Add($pos)
+
+    $view = New-Object System.Windows.Forms.WebBrowser
+    $view.Dock = 'Fill'; $view.ScriptErrorsSuppressed = $true; $view.AllowWebBrowserDrop = $false; $view.IsWebBrowserContextMenuEnabled = $true
+    # each topic is set as DocumentText (about:blank); anything else - a link, a typed address - is refused: the tool never goes online
+    $view.Add_Navigating({ if ($_.Url -and $_.Url.Scheme -ne 'about') { $_.Cancel = $true } })
+    $tourSplit.Panel2.Controls.Add($view); $tourSplit.Panel2.Controls.Add($bar); $view.BringToFront()
+
+    $script:Gui['TourTree'] = $tree; $script:Gui['TourNodes'] = $nodes; $script:Gui['TourView'] = $view; $script:Gui['TourSplit'] = $tourSplit
+    $script:Gui['TourPosition'] = $pos; $script:Gui['TourPicButton'] = $picButton; $script:Gui['TourIndex'] = 0; $script:Gui['TourHtml'] = ''
+}
+
+function Select-CodeTourTopic {
+    # Previous / Next and the first page: move the tree's selection, which shows the page.  Before the window has a
+    # handle the tree raises no events, so the page is drawn directly (-NoShow).
+    param([int]$Index)
+    $nodes = $script:Gui['TourNodes']
+    if (-not $nodes -or $Index -lt 0 -or $Index -ge $nodes.Count) { return }
+    $tree = $script:Gui['TourTree']
+    $tree.SelectedNode = $nodes[$Index]
+    $nodes[$Index].EnsureVisible()
+    if (-not $tree.IsHandleCreated) { Show-CodeTourEntry -Index $Index }
+}
+
+function Show-CodeTourEntry {
+    # Draws one topic as a page in the Code Tour tab.
+    param([int]$Index)
+    $entry = $script:CodeTour[$Index]
+    if (-not $entry) { return }
+    $script:Gui['TourIndex'] = $Index
+    try { $html = Get-CodeTourHtml -Entry $entry -Index $Index }
+    catch { $html = New-DetailsHtml -Title ([string]$entry.Title) -Console 'Tour' -Subtitle ('this topic could not be drawn: ' + (Get-ShortError $_)) }
+    $script:Gui['TourHtml'] = $html
+    $script:Gui['TourView'].DocumentText = $html
+    $script:Gui['TourPosition'].Text = ('topic {0} of {1}' -f ($Index + 1), @($script:CodeTour).Count)
+    $script:Gui['TourPicButton'].Enabled = [bool]$entry.Image
 }

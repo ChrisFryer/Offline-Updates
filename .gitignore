@@ -1,12 +1,19 @@
 # The Patch Palace - things that must never go into the repository
 
 # Patch files are 500 MB+ and are downloaded from the Microsoft Update Catalog, not stored here
-patches/*.msu
-patches/*.cab
+patches/**/*.msu
+patches/**/*.cab
+patches/**/*.exe
+patches/**/*.msp
+patches/**/*.iso
+patches/**/*.zip
 patches/_info/
 
 # Logs contain server names and operator identities
 logs/
+
+# References are for internal use only and contain sensitive information 
+references/
 
 # Server lists are site-specific; commit only the placeholder samples
 # (remove the next three lines if you DO want your real lists in the repo)
@@ -15,9 +22,36 @@ PatchGroup-*.txt
 !PatchGroup-B.txt
 !PatchGroup-C.txt
 
+# Reports contain host names, account names and findings
+reports/
+
+# Code-signing requests made on the About tab name your organisation and this PC
+signing/
+
+# SOE standards and the security profile / tailoring describe YOUR environment and risk decisions.
+# Remove these two lines if you want them versioned in a private repository.
+soe/*.json
+security/*.json
+# what the Settings tab saved: your products, change system and rules
+settings/*.json
+settings/*.part
+
+# Development only (the IDE): the build and test scripts are not part of the published tool
+Build-*.ps1
+tests/
+
 # Editor / OS noise
 Thumbs.db
 desktop.ini
 *.swp
 .vscode/
 CODE-REVIEW.md
+ROADMAP.md
+
+# change records (server names, ticket numbers) and software installers
+changes/
+software/**/*.exe
+software/**/*.msi
+software/**/*.msp
+software/**/*.zip
+software/_info/

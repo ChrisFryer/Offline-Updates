@@ -25,7 +25,7 @@
 #  (now -LiteralPath); R-20 two files with the same KB were not flagged.
 #  ---------------------------------------------------------------------
 #  HUMAN REVIEW  (fill in by hand and keep it in the file)
-#  Reviewer   : ___CF__________________________   Date : ___14-10-2026___________
+#  Reviewer   : ___CF__________________________   Date : ___30-10-2026___________
 #  Verdict    : [X] Approved   [ ] Approved with comments   [ ] Changes required
 #  Checked    : [x] read every function   [x] ran Get-PatchFiles on a real .msu
 #               [x] compared with CODE-REVIEW.md
@@ -36,80 +36,142 @@
 
 # Shown by the "Where do I get patches?" button and in the Code Tour.  Edit freely.
 $script:PatchHowTo = @'
-HOW TO FIND AND DOWNLOAD THIS MONTH'S PATCH  (on a machine that has internet)
+WHERE TO FIND MICROSOFT PATCHES  (do this on a machine that has internet, then copy the files over)
 
-1. Find the latest KB number - the update history page is easiest
-   Search "Windows Server 2022 update history" or open
-   https://support.microsoft.com/help/5005454   (the Server 2022 history hub)
-   The left-hand list is newest first, e.g.
-      "September 8, 2026 - KB5122882 (OS Build 20348.5622)"
-   The top entry WITHOUT the word "Preview" is the current cumulative update (LCU).
-   Note the OS Build number: compare it with the Build column in the grid to see
-   which servers are already current.
-   Numbers only, per Server version:
-   https://learn.microsoft.com/windows/release-health/windows-server-release-info
+The tool installs Windows and .NET Framework updates (.msu / .cab files) itself. For the other products it
+reports the installed level so you can see what is missing; those installers are run by hand for now.
 
-2. Download it from the Microsoft Update Catalog
-   Each history article has a "Microsoft Update Catalog" link under
-   "How to get this update", or open https://www.catalog.update.microsoft.com
-   and search for the KB number, e.g.   KB5122882
-   Server 2022 is listed as:
-      "Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems"
-   Server 2025 is listed as:
-      "... Microsoft server operating system version 24H2 ..."
-   Click Download, save the .msu, KEEP THE FILE NAME, copy it into the \patches folder.
+A. WINDOWS SERVER CUMULATIVE UPDATE (LCU) - the monthly patch
+   1. KB number: search "Windows Server 2022 update history" or open https://support.microsoft.com/help/5005454
+      (Server 2019: help/4464619, Server 2016: help/4000825, Server 2025: help/5045836). The list is newest first,
+      e.g. "September 8, 2026 - KB5122882 (OS Build 20348.5622)". Take the top entry WITHOUT the word "Preview".
+      The OS Build number is what the Build column in the grid shows, so you can see who is already current.
+      Numbers only, per version: https://learn.microsoft.com/windows/release-health/windows-server-release-info
+   2. Download: the history article links to the Microsoft Update Catalog under "How to get this update", or open
+      https://www.catalog.update.microsoft.com and search the KB. Server 2022 is listed as "Cumulative Update for
+      Microsoft server operating system version 21H2 for x64-based Systems"; Server 2025 is "version 24H2";
+      Server 2019 and 2016 are listed by name. Click Download, save the .msu, KEEP THE FILE NAME.
+   3. The servicing stack update (SSU) is bundled inside the LCU for 2019/2022/2025 - one file is enough.
 
-3. Sanity checks before you start
-   * File name starts with windows10.0-kb... for Server 2022  (windows11.0-kb... = Server 2025).
-   * The servicing stack update (SSU) is bundled inside the Server 2022 LCU - one file is enough.
-   * .NET Framework updates are separate KBs; add them the same way if they are required.
-   * Press "Reload lists + patches" and check the new KB column appears in the grid.
-   * The patch list shows the OS the file is for and "UNSIGNED" if the signature is not valid.
+B. .NET FRAMEWORK CUMULATIVE UPDATE - separate KB, same day as the LCU
+   Catalog search: ".NET Framework" "Windows Server 2022" (or the KB from the history page; the LCU article lists
+   it under ".NET Framework updates"). File names look like windows10.0-kb5126050-x64-ndp481_....msu. One file
+   per .NET line (4.8 / 4.8.1); the tool installs these the same way as the LCU.
+
+C. .NET RUNTIME (.NET 6 / 8 / 9, formerly .NET Core) - not a KB
+   https://dotnet.microsoft.com/download/dotnet - pick the version line the grid reports, download the Windows
+   x64 "Runtime" (or "Hosting Bundle" for IIS) installer (.exe). The tool reports installed runtimes and marks
+   end-of-life lines; install by hand: <file>.exe /install /quiet /norestart
+
+D. SQL SERVER CUMULATIVE UPDATE (CU) and SECURITY UPDATE (GDR)
+   https://learn.microsoft.com/sql/database-engine/install-windows/latest-updates-for-microsoft-sql-server
+   lists the latest CU and GDR per version (2016/2017/2019/2022) with build numbers. Compare with the build the
+   grid reports (also SELECT @@VERSION on the instance). Download the CU .exe from the KB article; install by
+   hand: SQLServer20xx-KBnnnnnnn-x64.exe /quiet /action=Patch /IAcceptSQLServerLicenseTerms /AllInstances
+
+E. EXCHANGE SERVER SECURITY UPDATE (SU) and CUMULATIVE UPDATE (CU)
+   https://learn.microsoft.com/exchange/new-features/build-numbers-and-release-dates gives the build per CU/SU.
+   SUs come from the Microsoft Download Center (search "Exchange Server 2019 security update <month>"); CUs are
+   ISO images. Install by hand on the Exchange server, SU: <file>.exe /passive (run elevated); CU: setup from the ISO.
+
+F. OTHER MICROSOFT COMPONENTS
+   Defender platform/engine updates: catalog search "KB4052623" (platform) - normally delivered with definitions.
+   Visual C++ runtimes, SQL ODBC/OLE DB drivers, Edge: vendor pages; the grid reports installed versions.
+
+G. DRIVERS AND FIRMWARE: from the hardware or hypervisor vendor. VMware Tools and other third-party software: the
+   Software tab, button "Where do I get software?" (the tool deploys them with the reboot suppressed).
+
+SANITY CHECKS BEFORE YOU START
+   * File name starts with windows10.0-kb... for Server 2016/2019/2022 (windows11.0-kb... = Server 2025); the
+     tool reads the real target build from inside the file and blocks a mismatch.
+   * Press "Reload lists + patches"; the new KB column appears, the patch list shows the OS the file is for,
+     and "UNSIGNED" if the Microsoft signature is not valid - do not use such a file.
 '@
 
 function Get-PatchFiles {
     # Returns one object per usable patch file:
-    #   Name, FullName, KB, SizeMB, Type, OsLine, TargetBuild, TargetOs, Signature, Signer, Hash
+    #   Name, FullName, KB, SizeMB, Type, PatchType, Installable, OsLine, TargetBuild, TargetOs, Signature, Signer, Hash
+    # PatchType comes from the sub-folder (patches\Windows, patches\DotNet, patches\SQL ...).  Files left in the
+    # root of patches\ count as Windows so the version 1 layout keeps working.
     if (-not (Test-Path -LiteralPath $script:Config.PatchFolder)) {
         New-Item -ItemType Directory -Path $script:Config.PatchFolder -Force | Out-Null
         Write-PatchLog "Created empty patch folder $($script:Config.PatchFolder)" 'WARN'
     }
+    foreach ($typeName in $script:Config.PatchTypes.Keys) {
+        $sub = Join-Path $script:Config.PatchFolder $typeName
+        if (-not (Test-Path -LiteralPath $sub)) { New-Item -ItemType Directory -Path $sub -Force | Out-Null }
+    }
 
     $patches = @()
-    $files = @(Get-ChildItem -LiteralPath $script:Config.PatchFolder -File |
-               Where-Object { $_.Extension -in '.msu', '.cab' } |
-               Sort-Object Name)
+    $candidates = @()
+    foreach ($f in (Get-ChildItem -LiteralPath $script:Config.PatchFolder -File)) { $candidates += [pscustomobject]@{ File = $f; PatchType = 'Windows' } }
+    foreach ($typeName in $script:Config.PatchTypes.Keys) {
+        $sub = Join-Path $script:Config.PatchFolder $typeName
+        foreach ($f in (Get-ChildItem -LiteralPath $sub -File -ErrorAction SilentlyContinue)) { $candidates += [pscustomobject]@{ File = $f; PatchType = $typeName } }
+    }
+    $installableExt = @('.msu', '.cab')
+    $reportExt      = @('.msu', '.cab', '.exe', '.msp', '.iso', '.zip')
 
-    foreach ($file in $files) {
-        if ($file.Name -match '(?i)(KB\d{6,7})') {
-            $kb = $Matches[1].ToUpper()
-        } else {
+    $seenNames = @{}
+    foreach ($c in ($candidates | Sort-Object { $_.PatchType }, { $_.File.Name })) {
+        $file = $c.File
+        if ($file.Name -ieq 'README.txt') { continue }
+        # one name, one staging path on the server: a second file with the same name (another sub-folder) is skipped
+        if ($seenNames.ContainsKey($file.Name.ToLower())) { Write-PatchLog ("Skipping '{0}\{1}' - a file with the same name is already listed from {2}; both would land on the same staging path" -f $c.PatchType, $file.Name, $seenNames[$file.Name.ToLower()]) 'WARN'; continue }
+        $seenNames[$file.Name.ToLower()] = $c.PatchType
+        $mode = $script:Config.PatchTypes[$c.PatchType]
+        $installable = ($mode -eq 'install')
+        if ($installable -and $file.Extension -notin $installableExt) {
+            Write-PatchLog "Skipping '$($c.PatchType)\$($file.Name)' - only .msu/.cab can be installed by the tool; put other installers in patches\Other" 'WARN'
+            continue
+        }
+        if (-not $installable -and $file.Extension -notin $reportExt) { continue }
+        $kb = ''
+        if ($file.Name -match '(?i)(KB\d{6,7})') { $kb = $Matches[1].ToUpper() }
+        if (-not $kb -and $installable) {
             Write-PatchLog "Skipping '$($file.Name)' - no KB number in the file name. Rename it to include e.g. KB5034770" 'WARN'
             continue
         }
+        if (-not $kb) { $kb = [System.IO.Path]::GetFileNameWithoutExtension($file.Name); if ($kb.Length -gt 28) { $kb = $kb.Substring(0, 28) } }
         # "windows10.0-kb..." = Server 2016/2019/2022 line, "windows11.0-kb..." = Windows 11 / Server 2025 line
         $osLine = ''
         if ($file.Name -match '(?i)^(windows\d+\.\d+)') { $osLine = $Matches[1].ToLower() }
-        Write-PatchLog ("Patch found: {0}  ({1} MB, {2})" -f $kb, [math]::Round($file.Length / 1MB, 1), $file.Name) 'INFO'
+        Write-PatchLog ("Patch found [{0}]: {1}  ({2} MB, {3})" -f $c.PatchType, $kb, [math]::Round($file.Length / 1MB, 1), $file.Name) 'INFO'
 
-        $info = Get-PatchFileInfo -Path $file.FullName
+        if ($installable) {
+            $info = Get-PatchFileInfo -Path $file.FullName
+        } else {
+            # Hand-installed types: signature still checked (it is cheap insurance), no build or hash needed.
+            $sigStatus = 'Unknown'; $signer = ''
+            try { $sig = Get-AuthenticodeSignature -LiteralPath $file.FullName -ErrorAction Stop; $sigStatus = [string]$sig.Status; if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject } } catch { }
+            $info = [pscustomobject]@{ TargetBuild = 0; Signature = $sigStatus; Signer = $signer; Hash = ''; Source = 'n/a'; Family = ''; DotNet = '' }
+        }
+        # a .NET Framework rollup: the .NET line from inside the file, else from its name ("-ndp481")
+        $dotNetLine = [string]$info.DotNet
+        if (-not $dotNetLine -and $file.Name -match '(?i)-ndp(\d{2,3})') { $dotNetLine = ConvertTo-DotNetLine -Digits $Matches[1] }
         $patches += [pscustomobject]@{
             Name        = $file.Name
             FullName    = $file.FullName
             KB          = $kb
             SizeMB      = [math]::Round($file.Length / 1MB, 1)
             Type        = $file.Extension.TrimStart('.').ToLower()
+            PatchType   = $c.PatchType
+            Installable = $installable
             OsLine      = $osLine
+            OsFamily    = [string]$info.Family      # 'windows10.0' for a .NET rollup that names no build (else '')
+            DotNetLine  = $dotNetLine               # '4.8.1' for a .NET rollup (else '')
             TargetBuild = $info.TargetBuild
             TargetOs    = (Get-OsNameForBuild -Build $info.TargetBuild)
             Signature   = $info.Signature
             Signer      = $info.Signer
             Hash        = $info.Hash
         }
-        if ($info.Signature -ne 'Valid') {
+        if ($installable -and $info.Signature -ne 'Valid') {
             Write-PatchLog "  -> $kb signature is '$($info.Signature)' (signer: '$($info.Signer)'). It will show as 'Blocked: signature' unless RequireValidSignature is turned off in 01-Config.ps1" 'WARN'
         }
-        if ($info.TargetBuild -eq 0) {
+        if ($installable -and $info.TargetBuild -eq 0 -and $info.Family -and $info.DotNet) {
+            Write-PatchLog "  -> $kb is a .NET Framework $($info.DotNet) rollup for the $($info.Family) line: no Windows build inside - each server's .NET line decides (Not applicable, or READY and DISM checks the rest)" 'INFO'
+        } elseif ($installable -and $info.TargetBuild -eq 0) {
             Write-PatchLog "  -> $kb target build could not be read from inside the file. It will show as 'Blocked: OS unknown' unless AllowUnknownTargetBuild is turned on" 'WARN'
         }
     }
@@ -153,8 +215,9 @@ function Get-PatchFileInfo {
     if (Test-Path -LiteralPath $cache) {
         $h = @{}
         foreach ($line in (Get-Content -LiteralPath $cache)) { if ($line -match '^([A-Za-z]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
-        if ($h['Stamp'] -eq $stamp -and $h['Hash'] -and $h.ContainsKey('TargetBuild') -and $h.ContainsKey('Signature')) {
-            return [pscustomobject]@{ TargetBuild = [int]$h['TargetBuild']; Signature = $h['Signature']; Signer = $h['Signer']; Hash = $h['Hash']; Source = $h['Source'] }
+        # Reader=3: the cache also holds the OS family and the .NET line (older entries are read again)
+        if ($h['Stamp'] -eq $stamp -and $h['Hash'] -and $h.ContainsKey('TargetBuild') -and $h.ContainsKey('Signature') -and $h['Reader'] -eq '3') {
+            return [pscustomobject]@{ TargetBuild = [int]$h['TargetBuild']; Signature = $h['Signature']; Signer = $h['Signer']; Hash = $h['Hash']; Source = $h['Source']; Family = [string]$h['Family']; DotNet = [string]$h['DotNet'] }
         }
     }
 
@@ -174,9 +237,9 @@ function Get-PatchFileInfo {
     $secs = [math]::Round($watch.Elapsed.TotalSeconds, 1)
     Write-PatchLog ("  -> {0}: target build {1} = {2} (from {3}); signature {4}; SHA256 {5}...  ({6} s, cached in patches\_info)" -f $file.Name, $build.Build, (Get-OsNameForBuild -Build $build.Build), $build.Source, $sigStatus, $hash.Substring(0, 12), $secs) 'INFO'
 
-    @("Stamp=$stamp", "TargetBuild=$($build.Build)", "TargetOs=$(Get-OsNameForBuild -Build $build.Build)", "Source=$($build.Source)",
-      "Signature=$sigStatus", "Signer=$signer", "Hash=$hash", "File=$($file.Name)", "Read=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Set-Content -LiteralPath $cache
-    return [pscustomobject]@{ TargetBuild = $build.Build; Signature = $sigStatus; Signer = $signer; Hash = $hash; Source = $build.Source }
+    @("Stamp=$stamp", "TargetBuild=$($build.Build)", "TargetOs=$(Get-OsNameForBuild -Build $build.Build)", "Source=$($build.Source)", "Family=$($build.Family)", "DotNet=$($build.DotNet)",
+      "Signature=$sigStatus", "Signer=$signer", "Hash=$hash", "File=$($file.Name)", "Read=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')", 'Reader=3') | Set-Content -LiteralPath $cache
+    return [pscustomobject]@{ TargetBuild = $build.Build; Signature = $sigStatus; Signer = $signer; Hash = $hash; Source = $build.Source; Family = [string]$build.Family; DotNet = [string]$build.DotNet }
 }
 
 function Read-PatchTargetBuild {
@@ -186,18 +249,25 @@ function Read-PatchTargetBuild {
     #          pkgProperties.txt has Installer Version="10.0.20348.1960"; the bundled servicing
     #          stack cab is called SSU-20348.xxxx-x64.cab.  Any of the three gives the build.
     #   .cab : update.mum inside carries the package version.
-    # Returns @{ Build = <int, 0 = unknown>; Source = <where it was read from> }
+    #   .NET : a .NET Framework rollup (windows10.0-kb...-ndp481.msu) carries NO Windows build: pkgProperties says
+    #          Applies to="Windows 10.0" (the whole line) and the .xml names Package_for_DotNetRollup_481 - the
+    #          file is listed by its .NET line and OS family instead, and DISM checks the exact applicability.
+    # Returns @{ Build = <int, 0 = unknown>; Source = <where it was read from>; Family = 'windows10.0' or ''; DotNet = '4.8.1' or '' }
     param([Parameter(Mandatory = $true)][string]$Path)
     $file = Get-Item -LiteralPath $Path
     $build = 0
     $how = ''
+    $family = ''; $dotNet = ''
     $temp = Join-Path $script:Config.PatchInfoFolder ('tmp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # Windows' own expand.exe by its full path: a Git for Windows or MSYS install puts a GNU "expand" (a text tool) on
+    # the PATH ahead of System32 on some operator PCs, and every file then reads as "not found" (seen 2026-10-29)
+    $expand = Join-Path $env:SystemRoot 'System32\expand.exe'
     try {
         New-Item -ItemType Directory -Path $temp -Force | Out-Null
         if ($file.Extension -eq '.msu') {
             Write-PatchLog "expand.exe -F:*.xml `"$($file.FullName)`" `"$temp`"   (pulls one small file out of the MSU to read the target build)" 'CMD'
-            $null = & expand.exe -F:*.xml "$($file.FullName)" "$temp" 2>&1
-            $null = & expand.exe -F:*pkgProperties.txt "$($file.FullName)" "$temp" 2>&1
+            $null = & $expand -F:*.xml "$($file.FullName)" "$temp" 2>&1
+            $null = & $expand -F:*pkgProperties.txt "$($file.FullName)" "$temp" 2>&1
             foreach ($xml in @(Get-ChildItem -LiteralPath $temp -Filter '*.xml' -ErrorAction SilentlyContinue)) {
                 $text = Get-Content -LiteralPath $xml.FullName -Raw
                 foreach ($m in [regex]::Matches($text, 'version="(\d{5})\.\d+\.\d+\.\d+"')) {
@@ -211,12 +281,31 @@ function Read-PatchTargetBuild {
                 }
             }
             if ($build -eq 0) {
-                $listing = (& expand.exe -D "$($file.FullName)" 2>&1) | Out-String
+                $listing = (& $expand -D "$($file.FullName)" 2>&1) | Out-String
                 if ($listing -match 'SSU-(\d{5})\.') { $build = [int]$Matches[1]; $how = 'SSU cab name' }
+            }
+            if ($build -eq 0) {
+                foreach ($props in @(Get-ChildItem -LiteralPath $temp -Filter '*pkgProperties.txt' -ErrorAction SilentlyContinue)) {
+                    $text = Get-Content -LiteralPath $props.FullName -Raw
+                    if ($text -match 'Applies to="Windows (\d+\.\d+)"') { $family = 'windows' + $Matches[1] }
+                }
+                foreach ($xml in @(Get-ChildItem -LiteralPath $temp -Filter '*.xml' -ErrorAction SilentlyContinue)) {
+                    $text = Get-Content -LiteralPath $xml.FullName -Raw
+                    if ($text -match 'Package_for_DotNetRollup_?(\d{2,3})') { $dotNet = ConvertTo-DotNetLine -Digits $Matches[1] }
+                }
+                # the 4.8 rollup names its package without the digits: the cab inside (...-NDP48.cab) and the catalogue's own
+                # file name (...-x64-ndp48_...msu) carry the line too
+                if (-not $dotNet) {
+                    $listing = (& $expand -D "$($file.FullName)" 2>&1) | Out-String
+                    if ($listing -match '(?i)-NDP(\d{2,3})\.cab') { $dotNet = ConvertTo-DotNetLine -Digits $Matches[1] }
+                    elseif ($file.Name -match '(?i)-ndp(\d{2,3})') { $dotNet = ConvertTo-DotNetLine -Digits $Matches[1] }
+                }
+                if ($family -and $dotNet) { $how = ('pkgProperties: a .NET Framework {0} rollup for the {1} line (no build inside)' -f $dotNet, $family) }
+                elseif ($family) { $how = ('pkgProperties: Applies to the {0} line (no build inside)' -f $family); $family = '' }   # only a .NET rollup is let through on the family alone
             }
         } else {
             Write-PatchLog "expand.exe -F:update.mum `"$($file.FullName)`" `"$temp`"" 'CMD'
-            $null = & expand.exe -F:update.mum "$($file.FullName)" "$temp" 2>&1
+            $null = & $expand -F:update.mum "$($file.FullName)" "$temp" 2>&1
             $mum = Join-Path $temp 'update.mum'
             if (Test-Path -LiteralPath $mum) {
                 $text = Get-Content -LiteralPath $mum -Raw
@@ -228,8 +317,15 @@ function Read-PatchTargetBuild {
     } finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($build -eq 0) { $how = 'not found' }
-    return @{ Build = $build; Source = $how }
+    if ($build -eq 0 -and -not $how) { $how = 'not found' }
+    return @{ Build = $build; Source = $how; Family = $family; DotNet = $dotNet }
+}
+
+function ConvertTo-DotNetLine {
+    # '481' -> '4.8.1', '48' -> '4.8', '472' -> '4.7.2' (the digits a .NET rollup package and its file name carry)
+    param([string]$Digits)
+    if (-not $Digits) { return '' }
+    return (($Digits.ToCharArray() | ForEach-Object { [string]$_ }) -join '.')
 }
 
 function Test-PatchOsMismatch {
@@ -266,19 +362,173 @@ function Get-PatchVerdict {
     # THE single "can this KB go on this server?" decision.  The grid cell (Get-PatchCellText)
     # and the install plan (New-PatchPlan) both call it, so they can never disagree.
     # Order: not checked / unreachable / already installed / pending reboot / busy servicing /
-    #        low disk / bad signature / OS unknown / wrong OS / READY
-    param($Status, $Patch)
+    #        low disk / bad signature / OS unknown / wrong OS / READY (or READY (staged) when the file is on the server);
+    #        an open install run on the server comes first of all, a .NET line the server does not run right after "by hand"
+    param($Status, $Patch, [string]$Server = '')
     $v = [pscustomobject]@{ Go = $false; Cell = ''; Reason = '' }
+    # an OS patch run the tool handed to this server and has not recorded yet (06-Install): the run's own KBs say so,
+    # nothing else goes in meanwhile - before anything else, because the flag needs no status (also after a restart)
+    if ($Server) {
+        $flag = Get-InstallFlag -Server $Server
+        if ($flag) {
+            $mine = (@($flag.KBs | ForEach-Object { [string]$_ }) -contains [string]$Patch.KB)
+            if ([string]$flag.State -eq 'unknown') {
+                if ($mine) { $v.Cell = 'RUN UNKNOWN'; $v.Reason = ('the install run {0} started {1} by {2} ended without a result: {3} - press "Analyse a failure (ticked)"' -f $flag.Stamp, $flag.Started, $flag.Operator, $flag.Note) }
+                else { $v.Cell = 'Blocked: run unknown'; $v.Reason = ('an install run on this server ({0}) ended without a result - analyse it first' -f $flag.Stamp) }
+            } else {
+                if ($mine) { $v.Cell = ('INSTALLING ({0} min)' -f (Get-InstallFlagMinutes -Flag $flag)); $v.Reason = ('installing since {0} by {1} (run {2}, a SYSTEM task on the server) - a status check records the result' -f $flag.Started, $flag.Operator, $flag.Stamp) }
+                else { $v.Cell = 'Blocked: installing'; $v.Reason = ('run {0} is installing {1} on this server - wait for it' -f $flag.Stamp, (@($flag.KBs) -join ', ')) }
+            }
+            return $v
+        }
+    }
     if (-not $Status)                                 { $v.Cell = 'not checked';         $v.Reason = 'not checked yet'; return $v }
     if (-not $Status.Reachable)                       { $v.Cell = '?';                   $v.Reason = 'unreachable - see log'; return $v }
     if ($Status.HotFixIDs -contains $Patch.KB)        { $v.Cell = 'Installed';           $v.Reason = 'already installed'; return $v }
-    if ($Status.HistoryInstalledKBs -contains $Patch.KB) { $v.Cell = 'Installed (history)'; $v.Reason = 'already installed (per Windows Update history)'; return $v }
+    # A cumulative update the server has already passed: Get-HotFix no longer lists it (the newer one replaced it),
+    # but the build says so.  data\product-patches.psd1 gives the build each listed KB brings (Get-KnownPatchBuild).
+    $known = Get-KnownPatchBuild -KB $Patch.KB
+    $srvMajor = 0; $srvUbr = -1; if ([string]$Status.Build -match '^(\d+)\.(\d+)$') { $srvMajor = [int]$Matches[1]; $srvUbr = [int]$Matches[2] }
+    if ($known -and $known.Build -eq $srvMajor -and $srvUbr -ge $known.UBR) { $v.Cell = 'Installed (build)'; $v.Reason = ('the server build {0} is at or above this update''s {1}.{2} - a later cumulative update already contains it' -f $Status.Build, $known.Build, $known.UBR); return $v }
+    # the update history keeps a 'Succeeded' entry even after the update was removed again: the build has the last word
+    $historyStale = ($known -and $known.Build -eq $srvMajor -and $srvUbr -ge 0 -and $srvUbr -lt $known.UBR)
+    if ($Status.HistoryInstalledKBs -contains $Patch.KB -and -not $historyStale) { $v.Cell = 'Installed (history)'; $v.Reason = 'already installed (per Windows Update history)'; return $v }
+    if ($Patch.PSObject.Properties['Installable'] -and -not $Patch.Installable) { $v.Cell = 'By hand'; $v.Reason = "$($Patch.PatchType) files are not installed by the tool - apply by hand, see the help text"; return $v }
+    # a .NET Framework rollup is for one .NET line: a server that runs another (the Inventory knows) does not take it
+    if ($Server -and $Patch.PSObject.Properties['DotNetLine'] -and $Patch.DotNetLine) {
+        $inv = Get-CollectorResult -Name 'Inventory' -Server $Server
+        if ($inv -and $inv.Reachable -and $inv.PSObject.Properties['NetFramework'] -and $inv.NetFramework -and [string]$inv.NetFramework -ne [string]$Patch.DotNetLine) {
+            $v.Cell = 'Not applicable'; $v.Reason = ('the file is for .NET Framework {0}; this server has {1} (inventory) - download the update for {1}' -f $Patch.DotNetLine, $inv.NetFramework); return $v
+        }
+    }
     if ($Status.PendingReboot)                        { $v.Cell = 'Blocked: reboot';     $v.Reason = "pending reboot ($($Status.RebootReasons)) - reboot first"; return $v }
     if ($Status.ServicingActive)                      { $v.Cell = 'Blocked: servicing';  $v.Reason = "servicing already running on the server ($($Status.ServicingReasons)) - wait and re-check"; return $v }
+    # Trellix Solidcore enforcing at the reboot rolls the update back (poqexec.exe is denied); unreadable = fail closed
+    if ($script:Config.RequireSolidcoreUpdateMode) {
+        $sc = Get-SolidcoreInfo -Status $Status
+        if ($sc.State -eq 'enforcing') { $v.Cell = 'Blocked: Solidcore'; $v.Reason = "Trellix Solidcore is enforcing ($(Get-SolidcoreText -Status $Status)) - the update would be rolled back when poqexec.exe runs at the reboot; wait for the Update Mode task, then check status again"; return $v }
+        if ($sc.State -eq 'unknown')   { $v.Cell = 'Blocked: Solidcore'; $v.Reason = "Trellix Solidcore is on the server but its mode could not be read ($($sc.Error)) - run sadmin status on the server"; return $v }
+    }
     if ($Status.FreeGB -lt $script:Config.MinFreeGB)  { $v.Cell = 'Blocked: disk';       $v.Reason = "low disk ($($Status.FreeGB) GB free on C:)"; return $v }
     if ($script:Config.RequireValidSignature -and $Patch.Signature -ne 'Valid') { $v.Cell = 'Blocked: signature'; $v.Reason = "file signature is '$($Patch.Signature)' - not a valid Microsoft-signed package"; return $v }
-    if ($Patch.TargetBuild -le 0 -and -not $script:Config.AllowUnknownTargetBuild) { $v.Cell = 'Blocked: OS unknown'; $v.Reason = 'target build could not be read from inside the file - see patches\_info and the log'; return $v }
+    $hasFamily = ($Patch.PSObject.Properties['OsFamily'] -and $Patch.OsFamily)   # a .NET rollup: no build inside, the line (10.0 / 11.0) is known
+    if ($Patch.TargetBuild -le 0 -and -not $hasFamily -and -not $script:Config.AllowUnknownTargetBuild) { $v.Cell = 'Blocked: OS unknown'; $v.Reason = 'target build could not be read from inside the file - see patches\_info and the log'; return $v }
+    # the server side of the same guard: a build that could not be read must not pass as "no mismatch"
+    $srvBuild = 0; [void][int]::TryParse(([string]$Status.Build -split '\.')[0], [ref]$srvBuild)
+    if ($srvBuild -le 0) { $v.Cell = 'Blocked: OS unknown'; $v.Reason = "the server's Windows build could not be read ('$($Status.Build)') - check the status log"; return $v }
     if (Test-PatchOsMismatch -Status $Status -Patch $Patch) { $v.Cell = 'Blocked: wrong OS'; $v.Reason = (Get-OsMismatchText -Status $Status -Patch $Patch); return $v }
     $v.Go = $true; $v.Cell = 'READY'; $v.Reason = 'ready'
+    if ($Patch.TargetBuild -le 0 -and $hasFamily) { $v.Reason = ('ready - a .NET Framework {0} package for the {1} line (no build inside); DISM checks the exact applicability (0x800F081E = not for this build)' -f $Patch.DotNetLine, $Patch.OsFamily) }
+    # a copy of the file already on the server (STAGE ONLY, or kept by an earlier run): same name and size - the install's
+    # copy step checks the hash and skips the transfer
+    if ($Status.PSObject.Properties['StagedFiles']) {
+        foreach ($sf in @($Status.StagedFiles)) {
+            $parts = [string]$sf -split '\|'
+            if ($parts.Count -ge 2 -and $parts[0] -eq [string]$Patch.Name -and [math]::Round(([double]$parts[1]) / 1MB, 1) -eq [double]$Patch.SizeMB) { $v.Cell = 'READY (staged)'; $v.Reason = 'ready - the file is already on the server (STAGE ONLY); PATCH IT! checks its hash and skips the copy'; break }
+        }
+    }
+    if ($historyStale -and $Status.HistoryInstalledKBs -contains $Patch.KB) { $v.Reason = ('ready - the update history lists it as installed, but the build {0} is below its {1}.{2} (removed again?)' -f $Status.Build, $known.Build, $known.UBR) }
     return $v
+}
+
+function Get-SolidcoreInfo {
+    # Trellix Solidcore (Application Control) as the status check read it.  The raw "sadmin status" lines are parsed
+    # here, on the operator side, so the rule sits in one testable place:
+    #   Present   : sadmin.exe (or the scsrvc service) exists on the server
+    #   Mode      : the "Solidifier:" line - Enabled (enforcing), Update (Update Mode) or Disabled
+    #   OnReboot  : the "Solidifier on reboot:" line - the mode the pending operations run under at the next boot
+    #   State     : '' = not on the server; 'ok' = Update or Disabled now AND on reboot; 'enforcing' = Enabled now or on
+    #               reboot (the update would be rolled back at the boot); 'unknown' = present but not readable
+    param($Status)
+    $info = [pscustomobject]@{ Present = $false; Mode = ''; OnReboot = ''; Cli = ''; Epo = ''; Error = ''; State = ''; Lines = @() }
+    if (-not $Status -or -not $Status.PSObject.Properties['SolidcorePresent'] -or -not $Status.SolidcorePresent) { return $info }
+    $info.Present = $true; $info.Error = [string]$Status.SolidcoreError; $info.Lines = @($Status.SolidcoreLines | ForEach-Object { [string]$_ })
+    foreach ($l in $info.Lines) {
+        if ($l -match '(?i)solidifier on reboot\s*:\s*(.+?)\s*$') { $info.OnReboot = $Matches[1] }
+        elseif ($l -match '(?i)solidifier\s*:\s*(.+?)\s*$') { $info.Mode = $Matches[1] }
+        elseif ($l -match '(?i)cli access\s*:\s*(.+?)\s*$') { $info.Cli = $Matches[1] }
+        elseif ($l -match '(?i)epo managed\s*:\s*(.+?)\s*$') { $info.Epo = $Matches[1] }
+    }
+    if (-not $info.Mode -and -not $info.Error) { $info.Error = 'no "Solidifier:" line in the sadmin status output' }
+    # the mode ON REBOOT is the one the update is applied under: without it the guard knows half and fails closed (R6-B05)
+    if ($info.Mode -and -not $info.OnReboot -and -not $info.Error) { $info.Error = 'no "Solidifier on reboot:" line in the sadmin status output' }
+    if ($info.Error -or -not $info.Mode) { $info.State = 'unknown'; return $info }
+    $info.State = 'ok'
+    foreach ($m in @($info.Mode, $info.OnReboot)) { if ($m -and $m -notmatch '(?i)update|disabled') { $info.State = 'enforcing' } }
+    return $info
+}
+
+function Get-SolidcoreText {
+    # The Solidcore cell of the grid and the status line: '' when Solidcore is not on the server, else "now, on reboot".
+    param($Status)
+    $i = Get-SolidcoreInfo -Status $Status
+    if (-not $i.Present) { return '' }
+    if ($i.State -eq 'unknown') { return 'could not be read' }
+    $later = $i.OnReboot; if (-not $later) { $later = '?' }
+    if ($i.State -eq 'enforcing') { return ('ENFORCING: {0} now, {1} on reboot' -f $i.Mode, $later) }
+    return ('{0} now, {1} on reboot' -f $i.Mode, $later)
+}
+
+function Test-TrellixInUse {
+    # TrellixInUse (Settings tab): off where Trellix is not used - its columns, boxes, buttons, warnings and confirmation go.
+    return [bool]$script:Config.TrellixInUse
+}
+
+function Get-TrellixAgentInfo {
+    # The Trellix Agent (ePO agent) services as the status check read them - masvc "Trellix Agent Service" and macmnsvc
+    # "Trellix Agent Common Services", one 'Name|DisplayName|State|StartMode' line each (TrellixAgentLines).  Read here,
+    # on the operator side, so the rule sits in one testable place:
+    #   Present  : at least one of the two services exists on the server
+    #   State    : '' = not on the server; 'unknown' = the services could not be read (TrellixAgentError);
+    #              'running' = every service Running and Auto (the normal state); 'stopped' = every
+    #              service Stopped and Disabled (what the tool sets before an install); 'mixed' = anything else (one of
+    #              each, Running but Manual or Disabled, Stopped but Automatic ...) - it would not come back at a boot
+    #   Text     : the grid cell - 'Running (Auto)', 'STOPPED (Disabled)', 'MIXED: masvc Running/Auto, macmnsvc Stopped/Disabled'
+    # The field test (October 2026) found an OS patch install only completes with both Disabled and stopped; stopped is
+    # still shown as a warning, because ePO hears nothing from the server until they run again.
+    param($Status)
+    $info = [pscustomobject]@{ Present = $false; State = ''; Text = ''; Services = @() }
+    if (-not $Status -or -not $Status.PSObject.Properties['TrellixAgentLines']) { return $info }
+    # the services could not be read: unknown, never "not on the server" - the install's stop step must not pass on it (R6-11)
+    if ($Status.PSObject.Properties['TrellixAgentError'] -and $Status.TrellixAgentError) { $info.Present = $true; $info.State = 'unknown'; $info.Text = 'could not be read'; return $info }
+    foreach ($l in @($Status.TrellixAgentLines)) {
+        $p = [string]$l -split '\|'
+        if ($p.Count -ge 4 -and $p[0]) { $info.Services += [pscustomobject]@{ Name = $p[0]; DisplayName = $p[1]; State = $p[2]; StartMode = $p[3] } }
+    }
+    if ($info.Services.Count -eq 0) { return $info }
+    $info.Present = $true
+    $n = $info.Services.Count
+    $running = @($info.Services | Where-Object { $_.State -eq 'Running' -and $_.StartMode -eq 'Auto' }).Count
+    $stopped = @($info.Services | Where-Object { $_.State -eq 'Stopped' }).Count
+    $disabled = @($info.Services | Where-Object { $_.StartMode -eq 'Disabled' }).Count
+    if ($running -eq $n) {
+        $info.State = 'running'
+        $info.Text = 'Running (Auto)'
+    } elseif ($stopped -eq $n -and $disabled -eq $n) {
+        $info.State = 'stopped'
+        $info.Text = 'STOPPED (Disabled)'
+    } else {
+        $info.State = 'mixed'
+        $info.Text = 'MIXED: ' + (@($info.Services | ForEach-Object { '{0} {1}/{2}' -f $_.Name, $_.State, $_.StartMode }) -join ', ')
+    }
+    return $info
+}
+
+function Get-TrellixAgentText {
+    # The Trellix Agent cell of the grid and the status line: '' when the agent is not on the server.
+    param($Status)
+    return (Get-TrellixAgentInfo -Status $Status).Text
+}
+
+function Get-KnownPatchBuild {
+    # The build a Windows cumulative update brings, from data\product-patches.psd1 (Windows = this month per build;
+    # WindowsHistory = earlier months, optional).  $null when the KB is not listed or its UBR is not filled in.
+    param([string]$KB)
+    if (-not $KB) { return $null }
+    $pp = Import-ToolData -Name 'product-patches.psd1'
+    if (-not $pp) { return $null }
+    foreach ($e in @($pp.Windows) + @($pp.WindowsHistory)) {
+        if ($e -and [string]$e.KB -ieq $KB -and [int]$e.UBR -gt 0 -and [int]$e.Build -gt 0) { return [pscustomobject]@{ Build = [int]$e.Build; UBR = [int]$e.UBR } }
+    }
+    return $null
 }
