@@ -67,7 +67,7 @@ Settings tab).
 | `reports\` | One HTML and one or more CSV files per Report button press. Git-ignored. |
 | `logs\` | `Patcher-YYYYMMDD.log`, one file per day. Git-ignored. |
 | `signing\` | Code-signing requests made on the About tab (`.req` for your certificate authority, `.txt` saying what to ask for). Git-ignored. |
-| `images\*.png` | The eleven Code Tour pictures. |
+| `images\*.png` | The eleven Code Tour pictures, and the screenshots of the consoles shown in this manual (`screen-*.png`). |
 | `Sign-Toolkit.ps1` | Signs the launcher, `lib\` and itself with your code-signing certificate, or reports their signatures (`-Check`). See Code signing. |
 | `README.txt` | Plain text, for when the tool will not start: how to launch it, unblock it and sign it with commands typed at the PowerShell prompt. |
 | `PatchGroup-A/B/C.txt` | Sample server lists. One name per line, `#` for comments. |
@@ -198,6 +198,11 @@ srv-dmz01.corp.local; soe: DMZ; class: internet-facing   settings combine; a # c
 ```
 
 ## O/S Patching console
+
+![The O/S Patching console](images/screen-os-patching.png)
+
+*The O/S Patching console: one row per server with a column per update file, the software currency grid under it,
+the update files and the action buttons on the right, and the running log at the foot of every console.*
 
 ### Patch folders
 
@@ -422,6 +427,11 @@ fresh by hand.
 
 ## Software console
 
+![The Software console](images/screen-software.png)
+
+*The Software console: a column per package shown (Installed, Newer, INSTALL, UPDATE -> version), the installed
+software with its removal verdicts underneath, and the installer list on the right.*
+
 Third-party software is handled the way OS patches are: a new version is staged ahead of the change window, installed
 with the reboot **suppressed**, and the one reboot that finishes the OS patches finishes the software too. VMware Tools
 is the first package: the tool deploys it instead of vCenter-managed upgrades. The same tab removes old or dormant
@@ -604,6 +614,10 @@ The record is kept in two places so it stays with the servers:
 
 ## Health console
 
+![The Health console](images/screen-health.png)
+
+*The Health console: the checks per server, and under the grid the three dials and the Needs attention list.*
+
 **Check health (ticked, or all)** runs every collector at once: Status, Inventory, Health, Agents, Settings (112 facts per
 server: OS, RDP, SMB, TLS, UAC, firewall, Defender, PowerShell logging, AppLocker, LAPS, event-log sizes and more), the
 configuration points (registry values and config-file lines, see SOE standards below) and Group Policy. The checks,
@@ -692,6 +706,11 @@ carries the comparison for every server shown. The SOE page tells you which grou
 
 ## Security console
 
+![The Security console, Servers page](images/screen-security-servers.png)
+
+*The Security console, Servers page: lights, counts, pass rate and tailoring per server, with the compliance
+dashboard below.*
+
 **AUDIT** runs the Status, Inventory, Agents, Settings, SecurityPolicy (`auditpol /get /category:* /r` and
 `secedit /export`, both read-only, both needing an administrator) and Group Policy collectors and evaluates 118 checks:
 
@@ -706,7 +725,7 @@ carries the comparison for every server shown. The SOE page tells you which grou
   privileged operating environments, software register, backups, vulnerability scanning) which stay Grey so they are
   not forgotten.
 
-The **Settings** tab sets the classification (Non-classified, OFFICIAL, OFFICIAL: Sensitive, PROTECTED, SECRET, TOP SECRET;
+The **Security profile** page sets the classification (Non-classified, OFFICIAL, OFFICIAL: Sensitive, PROTECTED, SECRET, TOP SECRET;
 it decides which ISM controls apply, the rest go Grey), the Essential Eight maturity target (a failed Essential Eight
 control at or below it is Red) and which servers face the internet (ML2 application control, two-week patch timeframe): a tick per server, saved onto the server's line in its group file as `; class: internet-facing`.
 
@@ -714,6 +733,10 @@ control at or below it is Red) and which servers face the internet (ML2 applicat
 (all, `group:<name>` or `server:<name>`), the action (**disable** = risk accepted, the row goes Grey with the reason;
 **downgrade** = a Red becomes Amber; **threshold** = another expected value), the reason, who decided, the date and a
 review date. A rule past its review date - or without a readable one - shows Amber with "REVIEW OVERDUE", and an overdue threshold no longer relaxes the check. When several rules match, the most specific scope wins (server, then group, then all). The file is `security\tailoring.json`.
+
+![The Tailoring page](images/screen-security-tailoring.png)
+
+*Tailoring (risk decisions): the rules in force, and the form that records a new one.*
 
 Tailoring is visible where the results are: the **Servers** page has a **Tailoring** column ("3 check(s): 2 accepted, 1 threshold; 1 review overdue"), and **Server config** with **Include tailoring** ticked (the default) names the rule in force in each cell ("[accepted]", "[threshold 10]"), shows tailored expected values, and counts servers that differ only by tailoring as different.
 
@@ -728,7 +751,21 @@ Six pages: **Servers** (one row per server with lights, counts, the pass rate an
 every check with its evidence, the ISM wording and the fix; the compliance dashboard below it), **Controls** (one row per check across the servers
 shown), **Server config** (one row per setting, one column per ticked server, every cell coloured by its verdict; tick the servers to compare, "Differences only" keeps the rows that differ, "Include tailoring" adds the risk decisions to the comparison), **GPO recommendations** (below), **Tailoring** and **Security profile** (classification, Essential Eight target, and the internet-facing tick per server). The report carries every page: the first four as tables, the tailoring rules in force as a fifth, and the profile in its notes.
 
+![The Controls page](images/screen-security-controls.png)
+
+*Controls: one row per check across the servers shown, with its ISM control, maturity level, severity, light and
+the servers in red.*
+
+![The Server config page](images/screen-security-server-config.png)
+
+*Server config: one row per setting, one column per ticked server, every cell coloured by its verdict.*
+
 ### What the classification changes
+
+![The Security profile page](images/screen-security-profile.png)
+
+*Security profile: the classification of the network, the Essential Eight target and the internet-facing tick per
+server.*
 
 The classification on the **Security profile** page decides which controls apply: every check cites ISM controls, and a
 check whose controls the ISM does not ask for at that classification is grey ("not applicable"). Most of the 118 checks
@@ -847,6 +884,10 @@ generated from; it is never edited by hand.
 
 ## Commands console
 
+![The Commands console](images/screen-commands.png)
+
+*The Commands console: the command, every server's answer underneath, and the cheat sheet on the right.*
+
 For an investigation: type **one** PowerShell command, tick the servers, press Enter (or **Run on ticked servers**),
 and every server's answer appears underneath under its own heading - formatted on the server, as its own console would
 show it, errors and warnings included. Read the answer, take what it shows into the next command: a service's program
@@ -900,6 +941,10 @@ those change in `lib\01-Config.ps1` only. A hand edit of `settings.json` that do
 fit its setting is skipped at start-up with a warning in the log, and the default stays.
 
 ## About
+
+![The About tab](images/screen-about.png)
+
+*The About tab: how the scripts load on this PC, and the code signature of every script.*
 
 The About tab shows the version, the author and the support address (**Copy support email** puts it on the
 clipboard), the source code link (<https://github.com/ChrisFryer/Offline-Updates>; **Copy GitHub link** puts it on the
